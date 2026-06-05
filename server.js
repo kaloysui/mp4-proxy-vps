@@ -2,7 +2,7 @@ const http = require('http');
 const { parse: parseUrl } = require('url');
 const { Readable } = require('stream');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 http.createServer(async (req, res) => {
   // CORS preflight
