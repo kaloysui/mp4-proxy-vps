@@ -1,7 +1,7 @@
 {
   "name": "mp4-proxy-worker",
   "version": "2.0.0",
-  "description": "Cloudflare Worker MP4/HLS proxy for 1embed.cc",
+  "description": "Cloudflare Worker MP4 proxy for 1embed.cc",
   "main": "src/index.js",
   "scripts": {
     "dev": "wrangler dev",

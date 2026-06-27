@@ -129,7 +129,7 @@ export default {
       }
 
       if (!resp.ok && resp.status !== 206) {
-        return errorResponse(`Upstream error: ${resp.status}`, resp.status >= 500 ? 502 : resp.status);
+        return errorResponse(`Upstream error: ${resp.status}`, resp.status);
       }
 
       return new Response(resp.body, {
