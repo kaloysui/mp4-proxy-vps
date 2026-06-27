@@ -1,15 +1,30 @@
 const ALLOWED_DOMAIN = '1embed.cc';
 const ALLOWED_ORIGIN = `https://${ALLOWED_DOMAIN}`;
 
+function isAllowedHost(value) {
+  if (!value) return false;
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === ALLOWED_DOMAIN || host.endsWith(`.${ALLOWED_DOMAIN}`);
+  } catch {
+    return false;
+  }
+}
+
 function isAllowed(request) {
   const origin = request.headers.get('origin') || '';
   const referer = request.headers.get('referer') || '';
-  return origin.includes(ALLOWED_DOMAIN) || referer.includes(ALLOWED_DOMAIN);
+  return isAllowedHost(origin) || isAllowedHost(referer);
 }
 
 function isM3u8(response, targetUrl) {
   const ct = (response.headers.get('content-type') || '').toLowerCase();
-  return ct.includes('mpegurl') || ct.includes('x-mpegurl') || targetUrl.toLowerCase().includes('.m3u8');
+  if (ct.includes('mpegurl') || ct.includes('x-mpegurl')) return true;
+  try {
+    return new URL(targetUrl).pathname.toLowerCase().endsWith('.m3u8');
+  } catch {
+    return false;
+  }
 }
 
 function rewriteM3u8(text, baseUrl, proxyBase, ref, origin) {
@@ -20,7 +35,7 @@ function rewriteM3u8(text, baseUrl, proxyBase, ref, origin) {
     if (line.startsWith('#') || line.trim() === '') {
       out.push(line);
     } else {
-      const absolute = line.startsWith('http') ? line : new URL(line, baseUrl).href;
+      const absolute = /^https?:\/\//i.test(line) ? line : new URL(line, baseUrl).href;
       const params = new URLSearchParams({ url: absolute });
       if (ref) params.set('ref', ref);
       if (origin) params.set('origin', origin);
@@ -35,6 +50,7 @@ function errorResponse(message, status) {
     status,
     headers: {
       'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
       'Content-Type': 'text/plain; charset=utf-8',
     },
   });
