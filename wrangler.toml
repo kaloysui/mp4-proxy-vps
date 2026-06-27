@@ -1,0 +1,9 @@
+name = "mp4-proxy"
+main = "src/index.js"
+compatibility_date = "2024-06-27"
+
+# Update the route to your own domain/subdomain before deploying.
+# Example pattern: "mp4-proxy.yourdomain.com/mp4-proxy*"
+# routes = [
+#   { pattern = "mp4-proxy.example.com/mp4-proxy*", custom_domain = true }
+# ]

@@ -1,11 +1,15 @@
 {
-  "name": "mp4-proxy-vps",
-  "version": "1.0.0",
-  "description": "Lightweight MP4 proxy server for VPS (Node.js 18+)",
-  "main": "server.js",
+  "name": "mp4-proxy-worker",
+  "version": "2.0.0",
+  "description": "Cloudflare Worker MP4/HLS proxy for 1embed.cc",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node server.js",
-    "start:prod": "PORT=8080 node server.js"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
   },
   "engines": {
     "node": ">=18"
