@@ -57,7 +57,7 @@ function buildUpstreamHeaders(targetUrl, request, userAgent, customReferer, cust
 async function fetchUpstream(targetUrl, request, userAgent, customReferer, customOrigin) {
   const headers = buildUpstreamHeaders(targetUrl, request, userAgent, customReferer, customOrigin);
   return fetch(targetUrl, {
-    method: 'GET',
+    method: request.method === 'HEAD' ? 'HEAD' : 'GET',
     headers,
   });
 }
@@ -87,7 +87,7 @@ export default {
         status: 204,
         headers: {
           'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
           'Access-Control-Allow-Headers': 'Range, Content-Type, Origin, Referer',
           'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
           'Access-Control-Max-Age': '86400',
@@ -95,9 +95,9 @@ export default {
       });
     }
 
-    if (request.method !== 'GET') {
-  return errorResponse('Method not allowed', 405);
-}
+    if (!['GET', 'HEAD'].includes(request.method)) {
+      return errorResponse('Method not allowed', 405);
+    }
 
     if (!isAllowed(request)) {
       return errorResponse('Forbidden', 403);
