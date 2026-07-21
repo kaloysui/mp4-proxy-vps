@@ -1,6 +1,3 @@
-const ALLOWED_DOMAIN = '1embed.cc';
-const ALLOWED_ORIGIN = `https://${ALLOWED_DOMAIN}`;
-
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -13,27 +10,11 @@ function randomUserAgent() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-function isAllowedHost(value) {
-  if (!value) return false;
-  try {
-    const host = new URL(value).hostname.toLowerCase();
-    return host === ALLOWED_DOMAIN || host.endsWith(`.${ALLOWED_DOMAIN}`);
-  } catch {
-    return false;
-  }
-}
-
-function isAllowed(request) {
-  const origin = request.headers.get('origin') || '';
-  const referer = request.headers.get('referer') || '';
-  return isAllowedHost(origin) || isAllowedHost(referer);
-}
-
 function errorResponse(message, status) {
   return new Response(message, {
     status,
     headers: {
-      'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+      'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
       'Content-Type': 'text/plain; charset=utf-8',
     },
@@ -63,12 +44,13 @@ async function fetchUpstream(targetUrl, request, userAgent, customReferer, custo
 }
 
 function shouldRetry(status) {
+  // Retry 403, 5xx errors
   return status === 403 || (status >= 500 && status <= 599);
 }
 
 function forwardResponseHeaders(resp) {
   const responseHeaders = {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Origin': '*',
     'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
   };
   for (const h of ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'ETag', 'Last-Modified', 'Cache-Control']) {
@@ -86,7 +68,7 @@ export default {
       return new Response(null, {
         status: 204,
         headers: {
-          'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+          'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
           'Access-Control-Allow-Headers': 'Range, Content-Type, Origin, Referer',
           'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
@@ -97,10 +79,6 @@ export default {
 
     if (!['GET', 'HEAD'].includes(request.method)) {
       return errorResponse('Method not allowed', 405);
-    }
-
-    if (!isAllowed(request)) {
-      return errorResponse('Forbidden', 403);
     }
 
     if (url.pathname !== '/mp4-proxy' && url.pathname !== '/mp4-proxy/') {
@@ -124,10 +102,12 @@ export default {
     try {
       let resp = await fetchUpstream(targetUrl, request, randomUserAgent(), customReferer, customOrigin);
 
+      // Retry on 403 (could be transient) or 5xx
       if (shouldRetry(resp.status)) {
         resp = await fetchUpstream(targetUrl, request, randomUserAgent(), customReferer, customOrigin);
       }
 
+      // If still not ok and not 206 (partial content is OK)
       if (!resp.ok && resp.status !== 206) {
         return errorResponse(`Upstream error: ${resp.status}`, resp.status);
       }
