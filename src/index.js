@@ -14,7 +14,7 @@ function errorResponse(message, status) {
   return new Response(message, {
     status,
     headers: {
-      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Origin': '*', // Permissive CORS
       'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
       'Content-Type': 'text/plain; charset=utf-8',
     },
@@ -22,6 +22,7 @@ function errorResponse(message, status) {
 }
 
 function buildUpstreamHeaders(targetUrl, request, userAgent, customReferer, customOrigin) {
+  // Use passed customReferer/Origin, otherwise fallback to target host
   const hostname = new URL(targetUrl).hostname;
   const headers = {
     'User-Agent': userAgent,
@@ -43,15 +44,10 @@ async function fetchUpstream(targetUrl, request, userAgent, customReferer, custo
   });
 }
 
-function shouldRetry(status) {
-  // Retry 403, 5xx errors
-  return status === 403 || (status >= 500 && status <= 599);
-}
-
 function forwardResponseHeaders(resp) {
   const responseHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+    'Access-Control-Allow-Origin': '*', // Permissive CORS
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag, Last-Modified, Cache-Control',
   };
   for (const h of ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'ETag', 'Last-Modified', 'Cache-Control']) {
     const v = resp.headers.get(h);
@@ -100,18 +96,11 @@ export default {
     const customOrigin = url.searchParams.get('origin');
 
     try {
+      // Direct fetch without retry logic to reduce latency, assuming better header handling fixes the 403
       let resp = await fetchUpstream(targetUrl, request, randomUserAgent(), customReferer, customOrigin);
 
-      // Retry on 403 (could be transient) or 5xx
-      if (shouldRetry(resp.status)) {
-        resp = await fetchUpstream(targetUrl, request, randomUserAgent(), customReferer, customOrigin);
-      }
-
-      // If still not ok and not 206 (partial content is OK)
-      if (!resp.ok && resp.status !== 206) {
-        return errorResponse(`Upstream error: ${resp.status}`, resp.status);
-      }
-
+      // Return response regardless of status, let the client handle it, 
+      // but ensure headers are passed for 200/206/etc.
       return new Response(resp.body, {
         status: resp.status,
         headers: forwardResponseHeaders(resp),
