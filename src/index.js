@@ -10,11 +10,17 @@ function randomUserAgent() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-function errorResponse(message, status) {
+// Dynamically return requesting Origin or '*' so all domains are allowed
+function getCorsOrigin(request) {
+  const origin = request.headers.get('origin');
+  return origin ? origin : '*';
+}
+
+function errorResponse(message, status, request) {
   return new Response(message, {
     status,
     headers: {
-      'Access-Control-Allow-Origin': '*', // Permissive CORS
+      'Access-Control-Allow-Origin': request ? getCorsOrigin(request) : '*',
       'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
       'Content-Type': 'text/plain; charset=utf-8',
     },
@@ -22,7 +28,6 @@ function errorResponse(message, status) {
 }
 
 function buildUpstreamHeaders(targetUrl, request, userAgent, customReferer, customOrigin) {
-  // Use passed customReferer/Origin, otherwise fallback to target host
   const hostname = new URL(targetUrl).hostname;
   const headers = {
     'User-Agent': userAgent,
@@ -44,10 +49,14 @@ async function fetchUpstream(targetUrl, request, userAgent, customReferer, custo
   });
 }
 
-function forwardResponseHeaders(resp) {
+function shouldRetry(status) {
+  return status === 403 || (status >= 500 && status <= 599);
+}
+
+function forwardResponseHeaders(resp, request) {
   const responseHeaders = {
-    'Access-Control-Allow-Origin': '*', // Permissive CORS
-    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag, Last-Modified, Cache-Control',
+    'Access-Control-Allow-Origin': getCorsOrigin(request),
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
   };
   for (const h of ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'ETag', 'Last-Modified', 'Cache-Control']) {
     const v = resp.headers.get(h);
@@ -60,11 +69,12 @@ export default {
   async fetch(request) {
     const url = new URL(request.url);
 
+    // Handle Preflight OPTIONS requests for all origins
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
         headers: {
-          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Origin': getCorsOrigin(request),
           'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
           'Access-Control-Allow-Headers': 'Range, Content-Type, Origin, Referer',
           'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
@@ -74,39 +84,45 @@ export default {
     }
 
     if (!['GET', 'HEAD'].includes(request.method)) {
-      return errorResponse('Method not allowed', 405);
+      return errorResponse('Method not allowed', 405, request);
     }
 
+    // Path validation
     if (url.pathname !== '/mp4-proxy' && url.pathname !== '/mp4-proxy/') {
-      return errorResponse('Not found', 404);
+      return errorResponse('Not found', 404, request);
     }
 
     const targetUrl = url.searchParams.get('url');
     if (!targetUrl) {
-      return errorResponse('Missing url', 400);
+      return errorResponse('Missing url', 400, request);
     }
 
     try {
       new URL(targetUrl);
     } catch {
-      return errorResponse('Invalid URL', 400);
+      return errorResponse('Invalid URL', 400, request);
     }
 
     const customReferer = url.searchParams.get('ref');
     const customOrigin = url.searchParams.get('origin');
 
     try {
-      // Direct fetch without retry logic to reduce latency, assuming better header handling fixes the 403
       let resp = await fetchUpstream(targetUrl, request, randomUserAgent(), customReferer, customOrigin);
 
-      // Return response regardless of status, let the client handle it, 
-      // but ensure headers are passed for 200/206/etc.
+      if (shouldRetry(resp.status)) {
+        resp = await fetchUpstream(targetUrl, request, randomUserAgent(), customReferer, customOrigin);
+      }
+
+      if (!resp.ok && resp.status !== 206) {
+        return errorResponse(`Upstream error: ${resp.status}`, resp.status, request);
+      }
+
       return new Response(resp.body, {
         status: resp.status,
-        headers: forwardResponseHeaders(resp),
+        headers: forwardResponseHeaders(resp, request),
       });
     } catch (err) {
-      return errorResponse(`Proxy failed: ${err.message}`, 502);
+      return errorResponse(`Proxy failed: ${err.message}`, 502, request);
     }
   },
 };
