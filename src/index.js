@@ -2,9 +2,10 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Handle CORS preflight requests (OPTIONS)
+    // 1. Handle CORS preflight requests (OPTIONS) for 1embed.cc & players
     if (request.method === "OPTIONS") {
       return new Response(null, {
+        status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -79,6 +80,7 @@ export default {
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
+        redirect: "follow",
       });
 
       const resHeaders = new Headers(proxyRes.headers);
@@ -87,6 +89,20 @@ export default {
         "Access-Control-Expose-Headers",
         "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition"
       );
+
+      // Force video/mp4 Content-Type if missing
+      const contentType = resHeaders.get("Content-Type");
+      if (!contentType || contentType === "application/octet-stream") {
+        resHeaders.set("Content-Type", "video/mp4");
+      }
+
+      // Force INLINE disposition so 1embed.cc plays video inline instead of downloading
+      resHeaders.set("Content-Disposition", "inline");
+
+      // Ensure Accept-Ranges is present for seeking
+      if (!resHeaders.get("Accept-Ranges")) {
+        resHeaders.set("Accept-Ranges", "bytes");
+      }
 
       return new Response(proxyRes.body, {
         status: proxyRes.status,
