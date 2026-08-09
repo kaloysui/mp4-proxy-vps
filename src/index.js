@@ -23,11 +23,20 @@ export default {
       }
 
       try {
+        const targetUrl = new URL(targetUrlStr);
+        const targetOrigin = targetUrl.origin;
+        const customReferer = url.searchParams.get("referer");
+        const customOrigin = url.searchParams.get("origin");
+
+        const referer = customReferer || targetOrigin + "/";
+        const origin = customOrigin || targetOrigin;
+
         const subRes = await fetch(targetUrlStr, {
           headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://1embed.cc/",
-            "Origin": "https://1embed.cc",
+            "User-Agent": request.headers.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": referer,
+            "Origin": origin,
+            "Accept-Language": request.headers.get("accept-language") || "en-US,en;q=0.9",
           },
         });
 
@@ -69,11 +78,21 @@ export default {
     }
 
     try {
+      const targetUrl = new URL(targetUrlStr);
+      const targetOrigin = targetUrl.origin;
+      const customReferer = url.searchParams.get("referer");
+      const customOrigin = url.searchParams.get("origin");
+
+      const referer = customReferer || targetOrigin + "/";
+      const origin = customOrigin || targetOrigin;
+
       const reqHeaders = new Headers();
-      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-      reqHeaders.set("Accept", "*/*");
-      reqHeaders.set("Referer", "https://1embed.cc/");
-      reqHeaders.set("Origin", "https://1embed.cc");
+      // Pass-through real client headers to bypass basic bot protection
+      reqHeaders.set("User-Agent", request.headers.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+      reqHeaders.set("Accept", request.headers.get("accept") || "*/*");
+      reqHeaders.set("Accept-Language", request.headers.get("accept-language") || "en-US,en;q=0.9");
+      reqHeaders.set("Referer", referer);
+      reqHeaders.set("Origin", origin);
 
       // Pass Range headers for seeking/streaming video and ts segments
       const rangeHeader = request.headers.get("Range");
@@ -118,9 +137,13 @@ export default {
       }
 
       // If it's an m3u8 playlist, rewrite URIs inside the playlist text to route through the proxy
-      if (contentType === "application/vnd.apple.mpegurl") {
+      if (contentType === "application/vnd.apple.mpegurl" && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
+        
+        let extraParams = "";
+        if (customReferer) extraParams += `&referer=${encodeURIComponent(customReferer)}`;
+        if (customOrigin) extraParams += `&origin=${encodeURIComponent(customOrigin)}`;
         
         const rewrittenLines = playlistText.split("\n").map((line) => {
           const trimmed = line.trim();
@@ -130,7 +153,7 @@ export default {
             return line.replace(/URI=["']([^"']+)["']/g, (match, p1) => {
               try {
                 const absUri = new URL(p1, targetUrlStr).href;
-                return `URI="${proxyOrigin}/?url=${encodeURIComponent(absUri)}"`;
+                return `URI="${proxyOrigin}/?url=${encodeURIComponent(absUri)}${extraParams}"`;
               } catch (e) {
                 return match;
               }
@@ -139,11 +162,14 @@ export default {
 
           try {
             const absUri = new URL(trimmed, targetUrlStr).href;
-            return `${proxyOrigin}/?url=${encodeURIComponent(absUri)}`;
+            return `${proxyOrigin}/?url=${encodeURIComponent(absUri)}${extraParams}`;
           } catch (e) {
             return line;
           }
         });
+
+        resHeaders.delete("Content-Encoding");
+        resHeaders.delete("Content-Length");
 
         return new Response(rewrittenLines.join("\n"), {
           status: proxyRes.status,
