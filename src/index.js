@@ -30,24 +30,14 @@ export default {
 
         const referer = customReferer || targetOrigin + "/";
         const origin = customOrigin || targetOrigin;
-        
-        // Copy original headers to mimic the browser perfectly
-        const reqHeaders = new Headers(request.headers);
-        reqHeaders.set("Referer", referer);
-        reqHeaders.set("Origin", origin);
-        reqHeaders.set("Host", targetUrl.hostname);
-        
-        // Strip Cloudflare identification headers
-        reqHeaders.delete("cf-connecting-ip");
-        reqHeaders.delete("cf-ipcountry");
-        reqHeaders.delete("cf-ray");
-        reqHeaders.delete("cf-visitor");
-        reqHeaders.delete("x-forwarded-for");
-        reqHeaders.delete("x-forwarded-proto");
-        reqHeaders.delete("x-real-ip");
 
         const subRes = await fetch(targetUrlStr, {
-          headers: reqHeaders,
+          headers: {
+            "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": referer,
+            "Origin": origin,
+            "Accept-Language": request.headers.get("Accept-Language") || "en-US,en;q=0.9",
+          },
         });
 
         if (!subRes.ok) {
@@ -96,20 +86,18 @@ export default {
       const referer = customReferer || targetOrigin + "/";
       const origin = customOrigin || targetOrigin;
 
-      // Copy original headers to mimic the browser perfectly
-      const reqHeaders = new Headers(request.headers);
+      const reqHeaders = new Headers();
+      reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+      reqHeaders.set("Accept", request.headers.get("Accept") || "*/*");
+      reqHeaders.set("Accept-Language", request.headers.get("Accept-Language") || "en-US,en;q=0.9");
       reqHeaders.set("Referer", referer);
       reqHeaders.set("Origin", origin);
-      reqHeaders.set("Host", targetUrl.hostname); // Crucial for CF bypass
 
-      // Strip Cloudflare identification headers to prevent CF blocking another CF IP
-      reqHeaders.delete("cf-connecting-ip");
-      reqHeaders.delete("cf-ipcountry");
-      reqHeaders.delete("cf-ray");
-      reqHeaders.delete("cf-visitor");
-      reqHeaders.delete("x-forwarded-for");
-      reqHeaders.delete("x-forwarded-proto");
-      reqHeaders.delete("x-real-ip");
+      // Pass Range headers for seeking/streaming video and ts segments
+      const rangeHeader = request.headers.get("Range");
+      if (rangeHeader) {
+        reqHeaders.set("Range", rangeHeader);
+      }
 
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
@@ -123,11 +111,6 @@ export default {
         "Access-Control-Expose-Headers",
         "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition"
       );
-      
-      // Remove restricted response headers returned by the target CF
-      resHeaders.delete("cf-cache-status");
-      resHeaders.delete("cf-ray");
-      resHeaders.delete("set-cookie");
 
       const cleanUrlPath = targetUrlStr.split("?")[0].toLowerCase();
       let contentType = resHeaders.get("Content-Type") || "";
@@ -148,6 +131,13 @@ export default {
       resHeaders.set("Content-Type", contentType);
       resHeaders.set("Content-Disposition", "inline");
 
+      // Set aggressive caching for chunks/media, disable for playlists
+      if (contentType === "video/mp2t" || contentType === "video/mp4" || contentType.includes("image/")) {
+        resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
+      } else if (contentType === "application/vnd.apple.mpegurl") {
+        resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+      }
+
       if (!resHeaders.get("Accept-Ranges")) {
         resHeaders.set("Accept-Ranges", "bytes");
       }
@@ -157,6 +147,7 @@ export default {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
         
+        // Prepare extra parameters to attach to inner stream URLs
         let extraParams = "";
         if (customReferer) extraParams += `&referer=${encodeURIComponent(customReferer)}`;
         if (customOrigin) extraParams += `&origin=${encodeURIComponent(customOrigin)}`;
@@ -184,6 +175,7 @@ export default {
           }
         });
 
+        // Delete these since we're modifying the body
         resHeaders.delete("Content-Encoding");
         resHeaders.delete("Content-Length");
 
