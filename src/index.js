@@ -30,14 +30,24 @@ export default {
 
         const referer = customReferer || targetOrigin + "/";
         const origin = customOrigin || targetOrigin;
+        
+        // Copy original headers to mimic the browser perfectly
+        const reqHeaders = new Headers(request.headers);
+        reqHeaders.set("Referer", referer);
+        reqHeaders.set("Origin", origin);
+        reqHeaders.set("Host", targetUrl.hostname);
+        
+        // Strip Cloudflare identification headers
+        reqHeaders.delete("cf-connecting-ip");
+        reqHeaders.delete("cf-ipcountry");
+        reqHeaders.delete("cf-ray");
+        reqHeaders.delete("cf-visitor");
+        reqHeaders.delete("x-forwarded-for");
+        reqHeaders.delete("x-forwarded-proto");
+        reqHeaders.delete("x-real-ip");
 
         const subRes = await fetch(targetUrlStr, {
-          headers: {
-            "User-Agent": request.headers.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": referer,
-            "Origin": origin,
-            "Accept-Language": request.headers.get("accept-language") || "en-US,en;q=0.9",
-          },
+          headers: reqHeaders,
         });
 
         if (!subRes.ok) {
@@ -86,19 +96,20 @@ export default {
       const referer = customReferer || targetOrigin + "/";
       const origin = customOrigin || targetOrigin;
 
-      const reqHeaders = new Headers();
-      // Pass-through real client headers to bypass basic bot protection
-      reqHeaders.set("User-Agent", request.headers.get("user-agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-      reqHeaders.set("Accept", request.headers.get("accept") || "*/*");
-      reqHeaders.set("Accept-Language", request.headers.get("accept-language") || "en-US,en;q=0.9");
+      // Copy original headers to mimic the browser perfectly
+      const reqHeaders = new Headers(request.headers);
       reqHeaders.set("Referer", referer);
       reqHeaders.set("Origin", origin);
+      reqHeaders.set("Host", targetUrl.hostname); // Crucial for CF bypass
 
-      // Pass Range headers for seeking/streaming video and ts segments
-      const rangeHeader = request.headers.get("Range");
-      if (rangeHeader) {
-        reqHeaders.set("Range", rangeHeader);
-      }
+      // Strip Cloudflare identification headers to prevent CF blocking another CF IP
+      reqHeaders.delete("cf-connecting-ip");
+      reqHeaders.delete("cf-ipcountry");
+      reqHeaders.delete("cf-ray");
+      reqHeaders.delete("cf-visitor");
+      reqHeaders.delete("x-forwarded-for");
+      reqHeaders.delete("x-forwarded-proto");
+      reqHeaders.delete("x-real-ip");
 
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
@@ -112,6 +123,11 @@ export default {
         "Access-Control-Expose-Headers",
         "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition"
       );
+      
+      // Remove restricted response headers returned by the target CF
+      resHeaders.delete("cf-cache-status");
+      resHeaders.delete("cf-ray");
+      resHeaders.delete("set-cookie");
 
       const cleanUrlPath = targetUrlStr.split("?")[0].toLowerCase();
       let contentType = resHeaders.get("Content-Type") || "";
