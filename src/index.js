@@ -86,7 +86,7 @@ export default {
     try {
       const initialTarget = new URL(targetUrlStr);
 
-      // Parse headers
+      // Parse custom headers
       const customHeadersRaw = url.searchParams.get("headers");
       let parsedHeaders = {};
       if (customHeadersRaw) {
@@ -125,60 +125,61 @@ export default {
         }
       }
 
+      // Crucial: Forward Range headers for MP4 / 206 Partial Content
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
       }
 
-      // Automatically FOLLOW 302 redirects from Peraspera to TotallyaCDN!
+      // Follow redirects automatically
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
         redirect: "follow",
       });
 
-      // The final URL after 302 redirects (e.g. https://totallyacdn.org/...)
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
       const resHeaders = new Headers(proxyRes.headers);
       resHeaders.set("Access-Control-Allow-Origin", "*");
+      resHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
       resHeaders.set("Access-Control-Allow-Headers", "*");
       resHeaders.set(
         "Access-Control-Expose-Headers",
         "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition"
       );
 
-      const isExplicitTs = url.pathname.endsWith(".ts");
-      const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
+      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4") || url.pathname.includes("ts-proxy");
+      const isExplicitM3U8 = url.pathname.endsWith(".m3u8") || url.pathname.includes("m3u8-proxy");
       let contentType = resHeaders.get("Content-Type") || "";
 
-      const isM3U8 = !isExplicitTs && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
+      // Check if this is an M3U8 text playlist
+      const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
 
       if (isM3U8) {
         contentType = "application/vnd.apple.mpegurl";
-      } else if (isExplicitTs || contentType.includes("mp2t") || contentType.includes("video/ts")) {
-        contentType = "video/mp2t";
-      } else if (contentType.includes("video/mp4") || url.pathname.endsWith(".mp4")) {
+      } else if (contentType.includes("mp4") || contentType.includes("video/iso.segment") || url.pathname.endsWith(".mp4")) {
         contentType = "video/mp4";
+      } else if (isExplicitSegment || contentType.includes("mp2t") || contentType.includes("video/ts")) {
+        contentType = "video/mp2t";
       }
 
       resHeaders.set("Content-Type", contentType);
       resHeaders.set("Content-Disposition", "inline");
 
-      // Caching: no caching for playlists so rewriter is always fresh
-      if (contentType === "video/mp2t" || contentType === "video/mp4") {
-        resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
-      } else if (isM3U8) {
+      if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
         resHeaders.set("Pragma", "no-cache");
         resHeaders.set("Expires", "0");
+      } else {
+        resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
       }
 
       if (!resHeaders.get("Accept-Ranges")) {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & Rewriter: Resolves all URIs relative to the final redirect destination (TotallyaCDN)
+      // 4. M3U8 Playlist Parser & Rewriter
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -204,9 +205,9 @@ export default {
               isNextStreamInf = false;
             }
 
-            // Rewrite any URI attributes in #EXT-X-MEDIA, #EXT-X-MAP, #EXT-X-KEY
-            return line.replace(/URI=(?:"([^"]+)"|'([^']+)'|([^\s,]+))/gi, (match, q1, q2, q3) => {
-              const rawUri = q1 || q2 || q3;
+            // Universal Tag Attribute URI Rewriter (#EXT-X-MAP, #EXT-X-MEDIA, #EXT-X-KEY, #EXT-X-PART, etc.)
+            return line.replace(/URI=(["'])(.*?)\1|URI=([^\s,]+)/gi, (match, quote, p1, p2) => {
+              const rawUri = p1 || p2;
               if (!rawUri) return match;
               try {
                 const absUri = new URL(rawUri, finalResolvedUrl).href;
@@ -214,14 +215,15 @@ export default {
                 const endpoint = isMedia && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy") || absUri.includes("cdn-m3u8"))
                   ? "m3u8-proxy.m3u8"
                   : "ts-proxy.ts";
-                return `URI="${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}"`;
+                const q = quote || '"';
+                return `URI=${q}${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}${q}`;
               } catch (e) {
                 return match;
               }
             });
           }
 
-          // Content Line (Playlist or Segment chunk)
+          // Content Line (Playlist variant URL OR Video segment chunk)
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
             let endpoint = "ts-proxy.ts";
@@ -251,7 +253,7 @@ export default {
         });
       }
 
-      // 5. Binary Video / Segment Stream
+      // 5. Binary Streaming (200 OK or 206 Partial Content for MP4/TS Chunks)
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
