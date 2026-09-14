@@ -5,6 +5,11 @@ const STREAM_SECRET = '1embed_secret_2026';
 const tokenStore = new Map();
 const MAX_CACHE_SIZE = 15000;
 
+// Rate Limiter Store (IP -> { count, startTime })
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 Minute window
+const MAX_EXTERNAL_REQUESTS = 2;    // Max 2 requests for non-1embed origins
+
 function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
 }
@@ -63,24 +68,79 @@ function saveToShortStore(payload) {
   return key;
 }
 
+// Check if Origin / Referer comes from 1embed.cc or authorized app domains
+function checkIs1EmbedOrigin(request) {
+  const reqOrigin = request.headers.get("Origin") || "";
+  const reqReferer = request.headers.get("Referer") || "";
+
+  const is1Embed =
+    reqOrigin.includes("1embed.cc") ||
+    reqReferer.includes("1embed.cc") ||
+    reqOrigin.includes("run.app") ||
+    reqReferer.includes("run.app") ||
+    reqOrigin.includes("localhost") ||
+    reqReferer.includes("localhost");
+
+  return {
+    is1Embed,
+    allowedOrigin: reqOrigin || (is1Embed ? "https://1embed.cc" : "*")
+  };
+}
+
+// Rate Limiter Enforcement (Only applies to external requests)
+function checkRateLimit(clientIp) {
+  const now = Date.now();
+  const record = rateLimitMap.get(clientIp);
+
+  if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
+    rateLimitMap.set(clientIp, { count: 1, startTime: now });
+    return true; // Allowed
+  }
+
+  if (record.count >= MAX_EXTERNAL_REQUESTS) {
+    return false; // Rate limit exceeded
+  }
+
+  record.count += 1;
+  return true; // Allowed
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
+    const { is1Embed, allowedOrigin } = checkIs1EmbedOrigin(request);
 
-    // 1. CORS Preflight (OPTIONS)
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": allowedOrigin,
+      "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition",
+    };
+
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "*",
+          ...corsHeaders,
           "Access-Control-Max-Age": "86400",
         },
       });
     }
 
-    // Extract path key (e.g., "/a8x9z2k1.ts" -> "a8x9z2k1", "/token.m3u8" -> "token")
+    // 2. Enforce Rate Limit for Non-1embed Requests (Limit = 2)
+    if (!is1Embed) {
+      const allowed = checkRateLimit(clientIp);
+      if (!allowed) {
+        return new Response("Too Many Requests. Rate limit 2 per minute for unauthorized domains.", {
+          status: 429,
+          headers: corsHeaders,
+        });
+      }
+    }
+
+    // Extract path key (e.g. "/a8x9z2k1.ts" -> "a8x9z2k1", "/token.m3u8" -> "token")
     const pathname = url.pathname.substring(1);
     const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
 
@@ -114,12 +174,12 @@ export default {
       }
     }
 
-    // 2. Subtitle Conversion Endpoint (/vtt or /*.vtt)
+    // 3. Subtitle Conversion Endpoint (/vtt or /*.vtt)
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
         return new Response("Missing target subtitle parameter", {
           status: 400,
-          headers: { "Access-Control-Allow-Origin": "*" },
+          headers: corsHeaders,
         });
       }
 
@@ -135,7 +195,7 @@ export default {
         });
 
         if (!subRes.ok) {
-          return new Response("Failed to fetch subtitle", { status: subRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
+          return new Response("Failed to fetch subtitle", { status: subRes.status, headers: corsHeaders });
         }
 
         const rawText = await subRes.text();
@@ -148,21 +208,24 @@ export default {
         return new Response(text, {
           status: 200,
           headers: {
+            ...corsHeaders,
             "Content-Type": "text/vtt; charset=utf-8",
-            "Access-Control-Allow-Origin": "*",
             "Cache-Control": "public, max-age=86400",
           },
         });
       } catch (err) {
-        return new Response("Error converting subtitle: " + err.message, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
+        return new Response("Error converting subtitle: " + err.message, { status: 500, headers: corsHeaders });
       }
     }
 
-    // 3. Media Proxy Engine
+    // 4. Media Streaming Proxy
     if (!payload || !payload.u) {
       return new Response("1Embed Stream Proxy Active", {
         status: 200,
-        headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/plain; charset=utf-8",
+        },
       });
     }
 
@@ -201,10 +264,9 @@ export default {
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
       const resHeaders = new Headers(proxyRes.headers);
-      resHeaders.set("Access-Control-Allow-Origin", "*");
-      resHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
-      resHeaders.set("Access-Control-Allow-Headers", "*");
-      resHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition");
+      for (const [ck, cv] of Object.entries(corsHeaders)) {
+        resHeaders.set(ck, cv);
+      }
 
       const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4");
       const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
@@ -235,7 +297,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g., /{shortKey}.ts)
+      // 5. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g., /{shortKey}.ts)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -306,7 +368,7 @@ export default {
         });
       }
 
-      // 5. Binary Streaming
+      // 6. Binary Streaming
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
@@ -315,7 +377,7 @@ export default {
     } catch (err) {
       return new Response("Stream Proxy Error: " + err.message, {
         status: 502,
-        headers: { "Access-Control-Allow-Origin": "*" },
+        headers: corsHeaders,
       });
     }
   },
