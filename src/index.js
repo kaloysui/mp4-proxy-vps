@@ -5,7 +5,7 @@ const STREAM_SECRET = '1embed_secret_2026';
 const tokenStore = new Map();
 const MAX_CACHE_SIZE = 15000;
 
-// Rate Limiter Store (IP -> { count, startTime })
+// Rate Limiter Store for Non-1Embed requests (IP -> { count, startTime })
 const rateLimitMap = new Map();
 const RATE_LIMIT_WINDOW_MS = 60000; // 1 Minute window
 const MAX_EXTERNAL_REQUESTS = 2;    // Max 2 requests for non-1embed origins
@@ -68,26 +68,20 @@ function saveToShortStore(payload) {
   return key;
 }
 
-// Check if Origin / Referer comes from 1embed.cc or authorized app domains
+// STRICT Domain Check: ONLY 1embed.cc is allowed
 function checkIs1EmbedOrigin(request) {
   const reqOrigin = request.headers.get("Origin") || "";
   const reqReferer = request.headers.get("Referer") || "";
 
-  const is1Embed =
-    reqOrigin.includes("1embed.cc") ||
-    reqReferer.includes("1embed.cc") ||
-    reqOrigin.includes("run.app") ||
-    reqReferer.includes("run.app") ||
-    reqOrigin.includes("localhost") ||
-    reqReferer.includes("localhost");
+  const is1Embed = reqOrigin.includes("1embed.cc") || reqReferer.includes("1embed.cc");
 
   return {
     is1Embed,
-    allowedOrigin: reqOrigin || (is1Embed ? "https://1embed.cc" : "*")
+    allowedOrigin: is1Embed ? (reqOrigin || "https://1embed.cc") : "https://1embed.cc"
   };
 }
 
-// Rate Limiter Enforcement (Only applies to external requests)
+// Rate Limiter (Applies strictly to external domains, limit = 2 per min)
 function checkRateLimit(clientIp) {
   const now = Date.now();
   const record = rateLimitMap.get(clientIp);
@@ -98,7 +92,7 @@ function checkRateLimit(clientIp) {
   }
 
   if (record.count >= MAX_EXTERNAL_REQUESTS) {
-    return false; // Rate limit exceeded
+    return false; // Rate limit exceeded (Max 2)
   }
 
   record.count += 1;
@@ -129,11 +123,11 @@ export default {
       });
     }
 
-    // 2. Enforce Rate Limit for Non-1embed Requests (Limit = 2)
+    // 2. Strict Rate Limit for non-1embed.cc requests (Limit = 2)
     if (!is1Embed) {
       const allowed = checkRateLimit(clientIp);
       if (!allowed) {
-        return new Response("Too Many Requests. Rate limit 2 per minute for unauthorized domains.", {
+        return new Response("Too Many Requests. Rate limit of 2 per minute reached for non-1embed.cc callers.", {
           status: 429,
           headers: corsHeaders,
         });
@@ -297,7 +291,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 5. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g., /{shortKey}.ts)
+      // 5. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g. /{shortKey}.ts)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -336,7 +330,7 @@ export default {
             });
           }
 
-          // Content Line (Segment URL or Playlist Variant URL)
+          // Content Line
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
             let ext = "ts";
