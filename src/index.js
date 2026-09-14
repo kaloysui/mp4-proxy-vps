@@ -15,11 +15,14 @@ export default {
       });
     }
 
-    // 2. Subtitle Conversion Endpoint (/vtt?url=... o /api/proxy/vtt)
+    // 2. Subtitle Conversion Endpoint (/vtt?url=...)
     if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
       const targetUrlStr = url.searchParams.get("url");
       if (!targetUrlStr) {
-        return new Response("Missing target 'url' parameter", { status: 400 });
+        return new Response("Missing target 'url' parameter", {
+          status: 400,
+          headers: { "Access-Control-Allow-Origin": "*" },
+        });
       }
 
       try {
@@ -40,7 +43,10 @@ export default {
         });
 
         if (!subRes.ok) {
-          return new Response("Failed to fetch subtitle", { status: subRes.status });
+          return new Response("Failed to fetch subtitle", {
+            status: subRes.status,
+            headers: { "Access-Control-Allow-Origin": "*" },
+          });
         }
 
         const rawText = await subRes.text();
@@ -60,7 +66,10 @@ export default {
           },
         });
       } catch (err) {
-        return new Response("Error converting subtitle: " + err.message, { status: 500 });
+        return new Response("Error converting subtitle: " + err.message, {
+          status: 500,
+          headers: { "Access-Control-Allow-Origin": "*" },
+        });
       }
     }
 
@@ -79,42 +88,30 @@ export default {
 
     try {
       const targetUrl = new URL(targetUrlStr);
-      const targetOrigin = targetUrl.origin;
-      const targetHost = targetUrl.hostname.toLowerCase();
 
-      // Read custom query parameters
-      const customReferer = url.searchParams.get("referer") || url.searchParams.get("ref");
-      const customOrigin = url.searchParams.get("origin") || url.searchParams.get("ori");
+      // Parse dynamic headers passed in query params
       const customHeadersRaw = url.searchParams.get("headers");
-
       let parsedHeaders = {};
       if (customHeadersRaw) {
         try {
           parsedHeaders = JSON.parse(customHeadersRaw);
-        } catch (e) {
-          // Ignore JSON parse errors
-        }
+        } catch (e) {}
       }
 
-      // Determine default Referer and Origin based on stream provider
-      let referer = customReferer || parsedHeaders["Referer"] || parsedHeaders["referer"];
-      let origin = customOrigin || parsedHeaders["Origin"] || parsedHeaders["origin"];
+      // Dynamic Referer & Origin resolution
+      const referer =
+        url.searchParams.get("referer") ||
+        url.searchParams.get("ref") ||
+        parsedHeaders["Referer"] ||
+        parsedHeaders["referer"] ||
+        targetUrl.origin + "/";
 
-      if (!referer) {
-        if (targetHost.includes("peraspera") || targetHost.includes("atlantic") || targetHost.includes("workers.dev")) {
-          referer = "https://atlantic.st/";
-          origin = origin || "https://atlantic.st";
-        } else if (targetHost.includes("stellar") || targetHost.includes("dryland")) {
-          referer = "https://stellar.gdn/";
-          origin = origin || "https://stellar.gdn";
-        } else if (targetHost.includes("rabbitstream") || targetHost.includes("megacloud") || targetHost.includes("dokicloud")) {
-          referer = "https://megacloud.tv/";
-          origin = origin || "https://megacloud.tv";
-        } else {
-          referer = targetOrigin + "/";
-          origin = origin || targetOrigin;
-        }
-      }
+      const origin =
+        url.searchParams.get("origin") ||
+        url.searchParams.get("ori") ||
+        parsedHeaders["Origin"] ||
+        parsedHeaders["origin"] ||
+        targetUrl.origin;
 
       const reqHeaders = new Headers();
       reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
@@ -125,14 +122,14 @@ export default {
         reqHeaders.set("Origin", origin);
       }
 
-      // Apply other passed custom headers
+      // Pass any other custom headers dynamically
       for (const [key, value] of Object.entries(parsedHeaders)) {
         if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
           reqHeaders.set(key, String(value));
         }
       }
 
-      // Pass Range headers for smooth seeking/streaming
+      // Forward Range header for video seeking
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
@@ -152,34 +149,25 @@ export default {
         "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition"
       );
 
-      const cleanUrlPath = targetUrlStr.split("?")[0].toLowerCase();
+      const isExplicitTs = url.pathname.endsWith(".ts");
+      const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
       let contentType = resHeaders.get("Content-Type") || "";
 
-      // Content-Type detection
-      const isM3U8 =
-        url.pathname.endsWith(".m3u8") ||
-        cleanUrlPath.endsWith(".m3u8") ||
-        contentType.includes("mpegurl") ||
-        contentType.includes("application/x-mpegURL") ||
-        (targetUrlStr.includes("payload=") && !cleanUrlPath.endsWith(".ts"));
+      // Distinguish M3U8 playlist vs binary video chunks
+      const isM3U8 = !isExplicitTs && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
 
       if (isM3U8) {
         contentType = "application/vnd.apple.mpegurl";
-      } else if (cleanUrlPath.endsWith(".ts") || contentType.includes("mp2t") || contentType.includes("video/ts")) {
+      } else if (isExplicitTs || contentType.includes("mp2t") || contentType.includes("video/ts")) {
         contentType = "video/mp2t";
-      } else if (cleanUrlPath.endsWith(".jpg") || cleanUrlPath.endsWith(".jpeg") || contentType.includes("image/jpeg")) {
-        contentType = "image/jpeg";
-      } else if (cleanUrlPath.endsWith(".png") || contentType.includes("image/png")) {
-        contentType = "image/png";
-      } else if (cleanUrlPath.endsWith(".mp4") || contentType.includes("video/mp4") || !contentType || contentType === "application/octet-stream") {
+      } else if (contentType.includes("video/mp4") || url.pathname.endsWith(".mp4")) {
         contentType = "video/mp4";
       }
 
       resHeaders.set("Content-Type", contentType);
       resHeaders.set("Content-Disposition", "inline");
 
-      // Set caching policies
-      if (contentType === "video/mp2t" || contentType === "video/mp4" || contentType.includes("image/")) {
+      if (contentType === "video/mp2t" || contentType === "video/mp4") {
         resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
       } else if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -189,26 +177,39 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist URL Rewriter
+      // 4. M3U8 Playlist URL Rewriter (Dynamic extraParams propagation)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
 
-        // Build header parameters to attach to inner stream URLs
         let extraParams = `&referer=${encodeURIComponent(referer)}`;
         if (origin) extraParams += `&origin=${encodeURIComponent(origin)}`;
         if (customHeadersRaw) extraParams += `&headers=${encodeURIComponent(customHeadersRaw)}`;
 
-        const rewrittenLines = playlistText.split("\n").map((line) => {
+        const lines = playlistText.split("\n");
+        let isNextStreamInf = false;
+        let isNextExtInf = false;
+
+        const rewrittenLines = lines.map((line) => {
           const trimmed = line.trim();
           if (!trimmed) return line;
 
           if (trimmed.startsWith("#")) {
-            // Handle AES key tags: #EXT-X-KEY:METHOD=AES-128,URI="..."
+            if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
+              isNextStreamInf = true;
+              isNextExtInf = false;
+            } else if (trimmed.startsWith("#EXTINF")) {
+              isNextExtInf = true;
+              isNextStreamInf = false;
+            }
+
+            // Handle tags with URIs (Audio tracks, Subtitles, AES Keys, Init Maps)
             return line.replace(/URI=["']([^"']+)["']/g, (match, p1) => {
               try {
                 const absUri = new URL(p1, targetUrlStr).href;
-                return `URI="${proxyOrigin}/ts-proxy.ts?url=${encodeURIComponent(absUri)}${extraParams}"`;
+                const isAudioOrSub = trimmed.startsWith("#EXT-X-MEDIA");
+                const endpoint = isAudioOrSub && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy")) ? "m3u8-proxy.m3u8" : "ts-proxy.ts";
+                return `URI="${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}"`;
               } catch (e) {
                 return match;
               }
@@ -217,10 +218,19 @@ export default {
 
           try {
             const absUri = new URL(trimmed, targetUrlStr).href;
-            const isSubPlaylist = absUri.includes(".m3u8") || (absUri.includes("payload=") && !absUri.includes(".ts"));
-            const endpoint = isSubPlaylist ? "m3u8-proxy.m3u8" : "ts-proxy.ts";
+            let endpoint = "ts-proxy.ts";
+            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("m3u8-proxy")) {
+              endpoint = "m3u8-proxy.m3u8";
+            } else if (isNextExtInf) {
+              endpoint = "ts-proxy.ts";
+            }
+
+            isNextStreamInf = false;
+            isNextExtInf = false;
             return `${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}`;
           } catch (e) {
+            isNextStreamInf = false;
+            isNextExtInf = false;
             return line;
           }
         });
@@ -242,7 +252,10 @@ export default {
         headers: resHeaders,
       });
     } catch (err) {
-      return new Response("Stream Proxy Error: " + err.message, { status: 502 });
+      return new Response("Stream Proxy Error: " + err.message, {
+        status: 502,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
     }
   },
 };
