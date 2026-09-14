@@ -2,6 +2,44 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // Helper functions to encode & decode target URLs (Base64 / Base64URL)
+    function decodeTargetUrl(param) {
+      if (!param) return null;
+      if (param.startsWith("http://") || param.startsWith("https://")) {
+        return param;
+      }
+      try {
+        let base64 = param.replace(/-/g, "+").replace(/_/g, "/");
+        while (base64.length % 4 !== 0) {
+          base64 += "=";
+        }
+        const decoded = atob(base64);
+        if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
+          return decoded;
+        }
+      } catch (e) {}
+      try {
+        const unescaped = decodeURIComponent(param);
+        let base64 = unescaped.replace(/-/g, "+").replace(/_/g, "/");
+        while (base64.length % 4 !== 0) {
+          base64 += "=";
+        }
+        const decoded = atob(base64);
+        if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
+          return decoded;
+        }
+      } catch (e) {}
+      return param;
+    }
+
+    function encodeTargetUrl(rawUrl) {
+      try {
+        return btoa(rawUrl).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      } catch (e) {
+        return encodeURIComponent(rawUrl);
+      }
+    }
+
     // 1. Universal CORS Preflight (OPTIONS)
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -17,7 +55,8 @@ export default {
 
     // 2. Subtitle Conversion (/vtt?url=...)
     if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
-      const targetUrlStr = url.searchParams.get("url");
+      const rawSubParam = url.searchParams.get("url") || url.searchParams.get("u");
+      const targetUrlStr = decodeTargetUrl(rawSubParam);
       if (!targetUrlStr) {
         return new Response("Missing target 'url' parameter", {
           status: 400,
@@ -72,14 +111,22 @@ export default {
     }
 
     // 3. Media & Stream Proxy Endpoint (?url=...)
-    const targetUrlStr = url.searchParams.get("url");
-    if (!targetUrlStr) {
+    const rawTargetParam = url.searchParams.get("url") || url.searchParams.get("u");
+    if (!rawTargetParam) {
       return new Response("1Embed Streaming Proxy is Online :)", {
         status: 200,
         headers: {
           "Content-Type": "text/plain; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
         },
+      });
+    }
+
+    const targetUrlStr = decodeTargetUrl(rawTargetParam);
+    if (!targetUrlStr) {
+      return new Response("Invalid target URL", {
+        status: 400,
+        headers: { "Access-Control-Allow-Origin": "*" },
       });
     }
 
@@ -125,7 +172,7 @@ export default {
         }
       }
 
-      // Crucial: Forward Range headers for MP4 / 206 Partial Content
+      // Forward Range headers for MP4 / 206 Partial Content
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
@@ -179,7 +226,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & Rewriter
+      // 4. M3U8 Playlist Parser & Rewriter with Base64 Obfuscation
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -205,7 +252,7 @@ export default {
               isNextStreamInf = false;
             }
 
-            // Universal Tag Attribute URI Rewriter (#EXT-X-MAP, #EXT-X-MEDIA, #EXT-X-KEY, #EXT-X-PART, etc.)
+            // Universal Tag Attribute URI Rewriter
             return line.replace(/URI=(["'])(.*?)\1|URI=([^\s,]+)/gi, (match, quote, p1, p2) => {
               const rawUri = p1 || p2;
               if (!rawUri) return match;
@@ -216,7 +263,8 @@ export default {
                   ? "m3u8-proxy.m3u8"
                   : "ts-proxy.ts";
                 const q = quote || '"';
-                return `URI=${q}${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}${q}`;
+                const obfuscatedUri = encodeTargetUrl(absUri);
+                return `URI=${q}${proxyOrigin}/${endpoint}?url=${encodeURIComponent(obfuscatedUri)}${extraParams}${q}`;
               } catch (e) {
                 return match;
               }
@@ -235,7 +283,8 @@ export default {
 
             isNextStreamInf = false;
             isNextExtInf = false;
-            return `${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}`;
+            const obfuscatedUri = encodeTargetUrl(absUri);
+            return `${proxyOrigin}/${endpoint}?url=${encodeURIComponent(obfuscatedUri)}${extraParams}`;
           } catch (e) {
             isNextStreamInf = false;
             isNextExtInf = false;
@@ -253,7 +302,7 @@ export default {
         });
       }
 
-      // 5. Binary Streaming (200 OK or 206 Partial Content for MP4/TS Chunks)
+      // 5. Binary Streaming
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
