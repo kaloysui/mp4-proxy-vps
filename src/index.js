@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. CORS preflight handler (OPTIONS)
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -15,7 +15,7 @@ export default {
       });
     }
 
-    // 2. Subtitle Conversion (/vtt?url=...)
+    // 2. Subtitle Conversion
     if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
       const targetUrlStr = url.searchParams.get("url");
       if (!targetUrlStr) {
@@ -70,9 +70,8 @@ export default {
       }
     }
 
-    // 3. Main Streaming Media Proxy (?url=...)
+    // 3. Media & Stream Proxy
     const targetUrlStr = url.searchParams.get("url");
-
     if (!targetUrlStr) {
       return new Response("1Embed Streaming Proxy is Online :)", {
         status: 200,
@@ -86,7 +85,7 @@ export default {
     try {
       const targetUrl = new URL(targetUrlStr);
 
-      // Parse headers parameter
+      // Parse headers
       const customHeadersRaw = url.searchParams.get("headers");
       let parsedHeaders = {};
       if (customHeadersRaw) {
@@ -95,7 +94,7 @@ export default {
         } catch (e) {}
       }
 
-      // Dynamic Referer & Origin
+      // Referer & Origin
       const referer =
         url.searchParams.get("referer") ||
         url.searchParams.get("ref") ||
@@ -119,14 +118,12 @@ export default {
         reqHeaders.set("Origin", origin);
       }
 
-      // Forward extra headers
       for (const [key, value] of Object.entries(parsedHeaders)) {
         if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
           reqHeaders.set(key, String(value));
         }
       }
 
-      // Range header for seeking
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
@@ -163,17 +160,20 @@ export default {
       resHeaders.set("Content-Type", contentType);
       resHeaders.set("Content-Disposition", "inline");
 
+      // Caching: NEVER cache M3U8 playlists so client always gets freshly rewritten proxy links
       if (contentType === "video/mp2t" || contentType === "video/mp4") {
         resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
       } else if (isM3U8) {
-        resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+        resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+        resHeaders.set("Pragma", "no-cache");
+        resHeaders.set("Expires", "0");
       }
 
       if (!resHeaders.get("Accept-Ranges")) {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & URL Rewriter (Rewriting EVERYTHING including EXT-X-MAP, EXT-X-KEY, etc.)
+      // 4. M3U8 Playlist Parser & Comprehensive Rewriter
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -190,7 +190,6 @@ export default {
           const trimmed = line.trim();
           if (!trimmed) return line;
 
-          // Rewriting any tag that contains URI="..." or URI='...'
           if (trimmed.startsWith("#")) {
             if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
               isNextStreamInf = true;
@@ -200,11 +199,14 @@ export default {
               isNextStreamInf = false;
             }
 
-            return line.replace(/URI=["']([^"']+)["']/gi, (match, rawUri) => {
+            // Universal Tag Attribute URI Rewriter: catches URI="...", URI='...', URI=http...
+            return line.replace(/URI=(?:"([^"]+)"|'([^']+)'|([^\s,]+))/gi, (match, q1, q2, q3) => {
+              const rawUri = q1 || q2 || q3;
+              if (!rawUri) return match;
               try {
                 const absUri = new URL(rawUri, targetUrlStr).href;
-                const isMediaTag = trimmed.startsWith("#EXT-X-MEDIA");
-                const endpoint = isMediaTag && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy"))
+                const isMedia = trimmed.startsWith("#EXT-X-MEDIA");
+                const endpoint = isMedia && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy"))
                   ? "m3u8-proxy.m3u8"
                   : "ts-proxy.ts";
                 return `URI="${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}"`;
@@ -214,7 +216,7 @@ export default {
             });
           }
 
-          // Plain URL line (Playlist variant OR Segment chunk)
+          // Content Line (Non-# line)
           try {
             const absUri = new URL(trimmed, targetUrlStr).href;
             let endpoint = "ts-proxy.ts";
