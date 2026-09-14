@@ -1,46 +1,73 @@
+// Secret Encryption Key for 1Embed Proxy
+const STREAM_SECRET = '1embed_secret_2026';
+
+// In-Memory Short Key Store (8-character random tokens)
+const tokenStore = new Map();
+const MAX_CACHE_SIZE = 10000;
+
+function generateShortKey() {
+  return Math.random().toString(36).substring(2, 10);
+}
+
+function packSync(obj) {
+  try {
+    const json = JSON.stringify(obj);
+    const encoder = new TextEncoder();
+    const jsonBytes = encoder.encode(json);
+    const secretBytes = encoder.encode(STREAM_SECRET);
+    const encrypted = new Uint8Array(jsonBytes.length);
+    for (let i = 0; i < jsonBytes.length; i++) {
+      encrypted[i] = jsonBytes[i] ^ secretBytes[i % secretBytes.length];
+    }
+    let binary = '';
+    for (let i = 0; i < encrypted.length; i++) {
+      binary += String.fromCharCode(encrypted[i]);
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  } catch (e) {
+    return null;
+  }
+}
+
+function unpackSync(token) {
+  if (!token) return null;
+  try {
+    let base64 = token.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4 !== 0) base64 += '=';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const encoder = new TextEncoder();
+    const secretBytes = encoder.encode(STREAM_SECRET);
+    const decrypted = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) {
+      decrypted[i] = bytes[i] ^ secretBytes[i % secretBytes.length];
+    }
+    const decoder = new TextDecoder();
+    const json = decoder.decode(decrypted);
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveToShortStore(payload) {
+  if (tokenStore.size >= MAX_CACHE_SIZE) {
+    const oldestKey = tokenStore.keys().next().value;
+    if (oldestKey) tokenStore.delete(oldestKey);
+  }
+  const key = generateShortKey();
+  tokenStore.set(key, payload);
+  return key;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Helper functions to encode & decode target URLs (Base64 / Base64URL)
-    function decodeTargetUrl(param) {
-      if (!param) return null;
-      if (param.startsWith("http://") || param.startsWith("https://")) {
-        return param;
-      }
-      try {
-        let base64 = param.replace(/-/g, "+").replace(/_/g, "/");
-        while (base64.length % 4 !== 0) {
-          base64 += "=";
-        }
-        const decoded = atob(base64);
-        if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
-          return decoded;
-        }
-      } catch (e) {}
-      try {
-        const unescaped = decodeURIComponent(param);
-        let base64 = unescaped.replace(/-/g, "+").replace(/_/g, "/");
-        while (base64.length % 4 !== 0) {
-          base64 += "=";
-        }
-        const decoded = atob(base64);
-        if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
-          return decoded;
-        }
-      } catch (e) {}
-      return param;
-    }
-
-    function encodeTargetUrl(rawUrl) {
-      try {
-        return btoa(rawUrl).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-      } catch (e) {
-        return encodeURIComponent(rawUrl);
-      }
-    }
-
-    // 1. Universal CORS Preflight (OPTIONS)
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -53,43 +80,57 @@ export default {
       });
     }
 
-    // 2. Subtitle Conversion (/vtt?url=...)
+    // Resolve Payload (Check short key 'v', encrypted payload 'd', or raw 'url')
+    let payload = null;
+    const shortKey = url.searchParams.get("v");
+    const encryptedData = url.searchParams.get("d");
+    const rawTargetUrlParam = url.searchParams.get("url");
+
+    if (shortKey && tokenStore.has(shortKey)) {
+      payload = tokenStore.get(shortKey);
+    } else if (encryptedData) {
+      payload = unpackSync(encryptedData);
+    } else if (rawTargetUrlParam) {
+      // Legacy fallback
+      payload = {
+        u: rawTargetUrlParam,
+        r: url.searchParams.get("referer") || url.searchParams.get("ref") || "",
+        o: url.searchParams.get("origin") || url.searchParams.get("ori") || "",
+      };
+      if (url.searchParams.get("headers")) {
+        try {
+          payload.h = JSON.parse(url.searchParams.get("headers"));
+        } catch (e) {}
+      }
+    }
+
+    // 2. Subtitle Conversion Endpoint
     if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
-      const rawSubParam = url.searchParams.get("url") || url.searchParams.get("u");
-      const targetUrlStr = decodeTargetUrl(rawSubParam);
-      if (!targetUrlStr) {
-        return new Response("Missing target 'url' parameter", {
+      if (!payload || !payload.u) {
+        return new Response("Missing target subtitle parameter", {
           status: 400,
           headers: { "Access-Control-Allow-Origin": "*" },
         });
       }
 
       try {
-        const targetUrl = new URL(targetUrlStr);
-        const referer = url.searchParams.get("referer") || url.searchParams.get("ref") || targetUrl.origin + "/";
-        const origin = url.searchParams.get("origin") || url.searchParams.get("ori") || targetUrl.origin;
-
-        const subRes = await fetch(targetUrlStr, {
+        const subRes = await fetch(payload.u, {
           headers: {
-            "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-            "Referer": referer,
-            "Origin": origin,
-            "Accept-Language": request.headers.get("Accept-Language") || "en-US,en;q=0.9",
+            "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
+            "Referer": payload.r || new URL(payload.u).origin + "/",
+            "Origin": payload.o || new URL(payload.u).origin,
+            "Accept-Language": "en-US,en;q=0.9",
           },
           redirect: "follow",
         });
 
         if (!subRes.ok) {
-          return new Response("Failed to fetch subtitle", {
-            status: subRes.status,
-            headers: { "Access-Control-Allow-Origin": "*" },
-          });
+          return new Response("Failed to fetch subtitle", { status: subRes.status, headers: { "Access-Control-Allow-Origin": "*" } });
         }
 
         const rawText = await subRes.text();
         let text = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
         text = text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
-
         if (!text.trim().startsWith("WEBVTT")) {
           text = "WEBVTT\n\n" + text.trim();
         }
@@ -103,68 +144,32 @@ export default {
           },
         });
       } catch (err) {
-        return new Response("Error converting subtitle: " + err.message, {
-          status: 500,
-          headers: { "Access-Control-Allow-Origin": "*" },
-        });
+        return new Response("Error converting subtitle: " + err.message, { status: 500, headers: { "Access-Control-Allow-Origin": "*" } });
       }
     }
 
-    // 3. Media & Stream Proxy Endpoint (?url=...)
-    const rawTargetParam = url.searchParams.get("url") || url.searchParams.get("u");
-    if (!rawTargetParam) {
-      return new Response("1Embed Streaming Proxy is Online :)", {
+    // 3. Media Streaming Proxy Endpoint
+    if (!payload || !payload.u) {
+      return new Response("1Embed Stream Proxy is Active", {
         status: 200,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Access-Control-Allow-Origin": "*",
-        },
-      });
-    }
-
-    const targetUrlStr = decodeTargetUrl(rawTargetParam);
-    if (!targetUrlStr) {
-      return new Response("Invalid target URL", {
-        status: 400,
-        headers: { "Access-Control-Allow-Origin": "*" },
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" },
       });
     }
 
     try {
+      const targetUrlStr = payload.u;
       const initialTarget = new URL(targetUrlStr);
 
-      // Parse custom headers
-      const customHeadersRaw = url.searchParams.get("headers");
-      let parsedHeaders = {};
-      if (customHeadersRaw) {
-        try {
-          parsedHeaders = JSON.parse(customHeadersRaw);
-        } catch (e) {}
-      }
-
-      // Dynamic Referer & Origin
-      const referer =
-        url.searchParams.get("referer") ||
-        url.searchParams.get("ref") ||
-        parsedHeaders["Referer"] ||
-        parsedHeaders["referer"] ||
-        initialTarget.origin + "/";
-
-      const origin =
-        url.searchParams.get("origin") ||
-        url.searchParams.get("ori") ||
-        parsedHeaders["Origin"] ||
-        parsedHeaders["origin"] ||
-        initialTarget.origin;
+      const referer = payload.r || initialTarget.origin + "/";
+      const origin = payload.o || initialTarget.origin;
+      const parsedHeaders = payload.h || {};
 
       const reqHeaders = new Headers();
-      reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
+      reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
       reqHeaders.set("Accept", request.headers.get("Accept") || "*/*");
       reqHeaders.set("Accept-Language", request.headers.get("Accept-Language") || "en-US,en;q=0.9");
       reqHeaders.set("Referer", referer);
-      if (origin) {
-        reqHeaders.set("Origin", origin);
-      }
+      if (origin) reqHeaders.set("Origin", origin);
 
       for (const [key, value] of Object.entries(parsedHeaders)) {
         if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
@@ -172,13 +177,11 @@ export default {
         }
       }
 
-      // Forward Range headers for MP4 / 206 Partial Content
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
       }
 
-      // Follow redirects automatically
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
@@ -191,16 +194,12 @@ export default {
       resHeaders.set("Access-Control-Allow-Origin", "*");
       resHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
       resHeaders.set("Access-Control-Allow-Headers", "*");
-      resHeaders.set(
-        "Access-Control-Expose-Headers",
-        "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition"
-      );
+      resHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition");
 
       const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4") || url.pathname.includes("ts-proxy");
       const isExplicitM3U8 = url.pathname.endsWith(".m3u8") || url.pathname.includes("m3u8-proxy");
       let contentType = resHeaders.get("Content-Type") || "";
 
-      // Check if this is an M3U8 text playlist
       const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
 
       if (isM3U8) {
@@ -226,14 +225,10 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & Rewriter with Base64 Obfuscation
+      // 4. M3U8 Playlist Parser & Rewriter using Short Keys
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
-
-        let extraParams = `&referer=${encodeURIComponent(referer)}`;
-        if (origin) extraParams += `&origin=${encodeURIComponent(origin)}`;
-        if (customHeadersRaw) extraParams += `&headers=${encodeURIComponent(customHeadersRaw)}`;
 
         const lines = playlistText.split("\n");
         let isNextStreamInf = false;
@@ -252,7 +247,6 @@ export default {
               isNextStreamInf = false;
             }
 
-            // Universal Tag Attribute URI Rewriter
             return line.replace(/URI=(["'])(.*?)\1|URI=([^\s,]+)/gi, (match, quote, p1, p2) => {
               const rawUri = p1 || p2;
               if (!rawUri) return match;
@@ -263,15 +257,18 @@ export default {
                   ? "m3u8-proxy.m3u8"
                   : "ts-proxy.ts";
                 const q = quote || '"';
-                const obfuscatedUri = encodeTargetUrl(absUri);
-                return `URI=${q}${proxyOrigin}/${endpoint}?url=${encodeURIComponent(obfuscatedUri)}${extraParams}${q}`;
+                
+                // Save child target under a short 8-char random key
+                const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+                const fallbackToken = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+                return `URI=${q}${proxyOrigin}/${endpoint}?v=${key}&d=${encodeURIComponent(fallbackToken)}${q}`;
               } catch (e) {
                 return match;
               }
             });
           }
 
-          // Content Line (Playlist variant URL OR Video segment chunk)
+          // Content Line
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
             let endpoint = "ts-proxy.ts";
@@ -283,8 +280,11 @@ export default {
 
             isNextStreamInf = false;
             isNextExtInf = false;
-            const obfuscatedUri = encodeTargetUrl(absUri);
-            return `${proxyOrigin}/${endpoint}?url=${encodeURIComponent(obfuscatedUri)}${extraParams}`;
+            
+            // Save child target under a short 8-char random key
+            const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+            const fallbackToken = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+            return `${proxyOrigin}/${endpoint}?v=${key}&d=${encodeURIComponent(fallbackToken)}`;
           } catch (e) {
             isNextStreamInf = false;
             isNextExtInf = false;
