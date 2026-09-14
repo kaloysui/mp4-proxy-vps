@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. CORS Preflight
+    // 1. Universal CORS Preflight (OPTIONS)
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -15,7 +15,7 @@ export default {
       });
     }
 
-    // 2. Subtitle Conversion
+    // 2. Subtitle Conversion (/vtt?url=...)
     if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
       const targetUrlStr = url.searchParams.get("url");
       if (!targetUrlStr) {
@@ -37,6 +37,7 @@ export default {
             "Origin": origin,
             "Accept-Language": request.headers.get("Accept-Language") || "en-US,en;q=0.9",
           },
+          redirect: "follow",
         });
 
         if (!subRes.ok) {
@@ -70,7 +71,7 @@ export default {
       }
     }
 
-    // 3. Media & Stream Proxy
+    // 3. Media & Stream Proxy Endpoint (?url=...)
     const targetUrlStr = url.searchParams.get("url");
     if (!targetUrlStr) {
       return new Response("1Embed Streaming Proxy is Online :)", {
@@ -83,7 +84,7 @@ export default {
     }
 
     try {
-      const targetUrl = new URL(targetUrlStr);
+      const initialTarget = new URL(targetUrlStr);
 
       // Parse headers
       const customHeadersRaw = url.searchParams.get("headers");
@@ -94,20 +95,20 @@ export default {
         } catch (e) {}
       }
 
-      // Referer & Origin
+      // Dynamic Referer & Origin
       const referer =
         url.searchParams.get("referer") ||
         url.searchParams.get("ref") ||
         parsedHeaders["Referer"] ||
         parsedHeaders["referer"] ||
-        targetUrl.origin + "/";
+        initialTarget.origin + "/";
 
       const origin =
         url.searchParams.get("origin") ||
         url.searchParams.get("ori") ||
         parsedHeaders["Origin"] ||
         parsedHeaders["origin"] ||
-        targetUrl.origin;
+        initialTarget.origin;
 
       const reqHeaders = new Headers();
       reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
@@ -129,11 +130,15 @@ export default {
         reqHeaders.set("Range", rangeHeader);
       }
 
+      // Automatically FOLLOW 302 redirects from Peraspera to TotallyaCDN!
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
         redirect: "follow",
       });
+
+      // The final URL after 302 redirects (e.g. https://totallyacdn.org/...)
+      const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
       const resHeaders = new Headers(proxyRes.headers);
       resHeaders.set("Access-Control-Allow-Origin", "*");
@@ -160,7 +165,7 @@ export default {
       resHeaders.set("Content-Type", contentType);
       resHeaders.set("Content-Disposition", "inline");
 
-      // Caching: NEVER cache M3U8 playlists so client always gets freshly rewritten proxy links
+      // Caching: no caching for playlists so rewriter is always fresh
       if (contentType === "video/mp2t" || contentType === "video/mp4") {
         resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
       } else if (isM3U8) {
@@ -173,7 +178,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & Comprehensive Rewriter
+      // 4. M3U8 Playlist Parser & Rewriter: Resolves all URIs relative to the final redirect destination (TotallyaCDN)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -199,14 +204,14 @@ export default {
               isNextStreamInf = false;
             }
 
-            // Universal Tag Attribute URI Rewriter: catches URI="...", URI='...', URI=http...
+            // Rewrite any URI attributes in #EXT-X-MEDIA, #EXT-X-MAP, #EXT-X-KEY
             return line.replace(/URI=(?:"([^"]+)"|'([^']+)'|([^\s,]+))/gi, (match, q1, q2, q3) => {
               const rawUri = q1 || q2 || q3;
               if (!rawUri) return match;
               try {
-                const absUri = new URL(rawUri, targetUrlStr).href;
+                const absUri = new URL(rawUri, finalResolvedUrl).href;
                 const isMedia = trimmed.startsWith("#EXT-X-MEDIA");
-                const endpoint = isMedia && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy"))
+                const endpoint = isMedia && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy") || absUri.includes("cdn-m3u8"))
                   ? "m3u8-proxy.m3u8"
                   : "ts-proxy.ts";
                 return `URI="${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}"`;
@@ -216,11 +221,11 @@ export default {
             });
           }
 
-          // Content Line (Non-# line)
+          // Content Line (Playlist or Segment chunk)
           try {
-            const absUri = new URL(trimmed, targetUrlStr).href;
+            const absUri = new URL(trimmed, finalResolvedUrl).href;
             let endpoint = "ts-proxy.ts";
-            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("m3u8-proxy")) {
+            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("m3u8-proxy") || absUri.includes("cdn-m3u8")) {
               endpoint = "m3u8-proxy.m3u8";
             } else if (isNextExtInf) {
               endpoint = "ts-proxy.ts";
@@ -246,7 +251,7 @@ export default {
         });
       }
 
-      // 5. Binary Media Streaming for TS and MP4 chunks
+      // 5. Binary Video / Segment Stream
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
