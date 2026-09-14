@@ -3,7 +3,7 @@ const STREAM_SECRET = '1embed_secret_2026';
 
 // In-Memory Short Key Store (8-character random tokens)
 const tokenStore = new Map();
-const MAX_CACHE_SIZE = 10000;
+const MAX_CACHE_SIZE = 15000;
 
 function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
@@ -67,7 +67,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. CORS Preflight
+    // 1. CORS Preflight (OPTIONS)
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -80,32 +80,42 @@ export default {
       });
     }
 
-    // Resolve Payload (Check short key 'v', encrypted payload 'd', or raw 'url')
-    let payload = null;
-    const shortKey = url.searchParams.get("v");
-    const encryptedData = url.searchParams.get("d");
-    const rawTargetUrlParam = url.searchParams.get("url");
+    // Extract path key (e.g., "/a8x9z2k1.ts" -> "a8x9z2k1", "/token.m3u8" -> "token")
+    const pathname = url.pathname.substring(1);
+    const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
 
-    if (shortKey && tokenStore.has(shortKey)) {
-      payload = tokenStore.get(shortKey);
-    } else if (encryptedData) {
-      payload = unpackSync(encryptedData);
-    } else if (rawTargetUrlParam) {
-      // Legacy fallback
-      payload = {
-        u: rawTargetUrlParam,
-        r: url.searchParams.get("referer") || url.searchParams.get("ref") || "",
-        o: url.searchParams.get("origin") || url.searchParams.get("ori") || "",
-      };
-      if (url.searchParams.get("headers")) {
-        try {
-          payload.h = JSON.parse(url.searchParams.get("headers"));
-        } catch (e) {}
+    let payload = null;
+
+    // A. Check in-memory short key cache
+    if (pathKey && tokenStore.has(pathKey)) {
+      payload = tokenStore.get(pathKey);
+    } 
+    // B. Check if path is encrypted token
+    else if (pathKey) {
+      payload = unpackSync(pathKey);
+    }
+
+    // C. Fallbacks for query params (?v=, ?d=, ?url=)
+    if (!payload) {
+      const qv = url.searchParams.get("v");
+      const qd = url.searchParams.get("d");
+      const qurl = url.searchParams.get("url");
+
+      if (qv && tokenStore.has(qv)) {
+        payload = tokenStore.get(qv);
+      } else if (qd) {
+        payload = unpackSync(qd);
+      } else if (qurl) {
+        payload = {
+          u: qurl,
+          r: url.searchParams.get("referer") || url.searchParams.get("ref") || "",
+          o: url.searchParams.get("origin") || url.searchParams.get("ori") || "",
+        };
       }
     }
 
-    // 2. Subtitle Conversion Endpoint
-    if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
+    // 2. Subtitle Conversion Endpoint (/vtt or /*.vtt)
+    if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
         return new Response("Missing target subtitle parameter", {
           status: 400,
@@ -148,9 +158,9 @@ export default {
       }
     }
 
-    // 3. Media Streaming Proxy Endpoint
+    // 3. Media Proxy Engine
     if (!payload || !payload.u) {
-      return new Response("1Embed Stream Proxy is Active", {
+      return new Response("1Embed Stream Proxy Active", {
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" },
       });
@@ -196,8 +206,8 @@ export default {
       resHeaders.set("Access-Control-Allow-Headers", "*");
       resHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition");
 
-      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4") || url.pathname.includes("ts-proxy");
-      const isExplicitM3U8 = url.pathname.endsWith(".m3u8") || url.pathname.includes("m3u8-proxy");
+      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4");
+      const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
       let contentType = resHeaders.get("Content-Type") || "";
 
       const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
@@ -225,7 +235,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist Parser & Rewriter using Short Keys
+      // 4. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g., /{shortKey}.ts)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -253,38 +263,32 @@ export default {
               try {
                 const absUri = new URL(rawUri, finalResolvedUrl).href;
                 const isMedia = trimmed.startsWith("#EXT-X-MEDIA");
-                const endpoint = isMedia && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy") || absUri.includes("cdn-m3u8"))
-                  ? "m3u8-proxy.m3u8"
-                  : "ts-proxy.ts";
+                const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
                 const q = quote || '"';
                 
-                // Save child target under a short 8-char random key
                 const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-                const fallbackToken = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-                return `URI=${q}${proxyOrigin}/${endpoint}?v=${key}&d=${encodeURIComponent(fallbackToken)}${q}`;
+                return `URI=${q}${proxyOrigin}/${key}.${ext}${q}`;
               } catch (e) {
                 return match;
               }
             });
           }
 
-          // Content Line
+          // Content Line (Segment URL or Playlist Variant URL)
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
-            let endpoint = "ts-proxy.ts";
-            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("m3u8-proxy") || absUri.includes("cdn-m3u8")) {
-              endpoint = "m3u8-proxy.m3u8";
+            let ext = "ts";
+            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) {
+              ext = "m3u8";
             } else if (isNextExtInf) {
-              endpoint = "ts-proxy.ts";
+              ext = "ts";
             }
 
             isNextStreamInf = false;
             isNextExtInf = false;
             
-            // Save child target under a short 8-char random key
             const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-            const fallbackToken = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-            return `${proxyOrigin}/${endpoint}?v=${key}&d=${encodeURIComponent(fallbackToken)}`;
+            return `${proxyOrigin}/${key}.${ext}`;
           } catch (e) {
             isNextStreamInf = false;
             isNextExtInf = false;
