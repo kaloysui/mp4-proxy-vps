@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Handle CORS preflight requests (OPTIONS)
+    // 1. CORS preflight handler (OPTIONS)
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -15,7 +15,7 @@ export default {
       });
     }
 
-    // 2. Subtitle Conversion Endpoint (/vtt?url=...)
+    // 2. Subtitle Conversion (/vtt?url=...)
     if (url.pathname === "/vtt" || url.pathname === "/api/proxy/vtt") {
       const targetUrlStr = url.searchParams.get("url");
       if (!targetUrlStr) {
@@ -27,11 +27,8 @@ export default {
 
       try {
         const targetUrl = new URL(targetUrlStr);
-        const customReferer = url.searchParams.get("referer") || url.searchParams.get("ref");
-        const customOrigin = url.searchParams.get("origin") || url.searchParams.get("ori");
-
-        const referer = customReferer || targetUrl.origin + "/";
-        const origin = customOrigin || targetUrl.origin;
+        const referer = url.searchParams.get("referer") || url.searchParams.get("ref") || targetUrl.origin + "/";
+        const origin = url.searchParams.get("origin") || url.searchParams.get("ori") || targetUrl.origin;
 
         const subRes = await fetch(targetUrlStr, {
           headers: {
@@ -73,7 +70,7 @@ export default {
       }
     }
 
-    // 3. Media & File Proxy Endpoint (?url=...)
+    // 3. Main Streaming Media Proxy (?url=...)
     const targetUrlStr = url.searchParams.get("url");
 
     if (!targetUrlStr) {
@@ -89,7 +86,7 @@ export default {
     try {
       const targetUrl = new URL(targetUrlStr);
 
-      // Parse dynamic headers passed in query params
+      // Parse headers parameter
       const customHeadersRaw = url.searchParams.get("headers");
       let parsedHeaders = {};
       if (customHeadersRaw) {
@@ -98,7 +95,7 @@ export default {
         } catch (e) {}
       }
 
-      // Dynamic Referer & Origin resolution
+      // Dynamic Referer & Origin
       const referer =
         url.searchParams.get("referer") ||
         url.searchParams.get("ref") ||
@@ -122,14 +119,14 @@ export default {
         reqHeaders.set("Origin", origin);
       }
 
-      // Pass any other custom headers dynamically
+      // Forward extra headers
       for (const [key, value] of Object.entries(parsedHeaders)) {
         if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
           reqHeaders.set(key, String(value));
         }
       }
 
-      // Forward Range header for video seeking
+      // Range header for seeking
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
@@ -153,7 +150,6 @@ export default {
       const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
       let contentType = resHeaders.get("Content-Type") || "";
 
-      // Distinguish M3U8 playlist vs binary video chunks
       const isM3U8 = !isExplicitTs && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
 
       if (isM3U8) {
@@ -177,7 +173,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 4. M3U8 Playlist URL Rewriter (Dynamic extraParams propagation)
+      // 4. M3U8 Playlist Parser & URL Rewriter (Rewriting EVERYTHING including EXT-X-MAP, EXT-X-KEY, etc.)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -194,6 +190,7 @@ export default {
           const trimmed = line.trim();
           if (!trimmed) return line;
 
+          // Rewriting any tag that contains URI="..." or URI='...'
           if (trimmed.startsWith("#")) {
             if (trimmed.startsWith("#EXT-X-STREAM-INF")) {
               isNextStreamInf = true;
@@ -203,12 +200,13 @@ export default {
               isNextStreamInf = false;
             }
 
-            // Handle tags with URIs (Audio tracks, Subtitles, AES Keys, Init Maps)
-            return line.replace(/URI=["']([^"']+)["']/g, (match, p1) => {
+            return line.replace(/URI=["']([^"']+)["']/gi, (match, rawUri) => {
               try {
-                const absUri = new URL(p1, targetUrlStr).href;
-                const isAudioOrSub = trimmed.startsWith("#EXT-X-MEDIA");
-                const endpoint = isAudioOrSub && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy")) ? "m3u8-proxy.m3u8" : "ts-proxy.ts";
+                const absUri = new URL(rawUri, targetUrlStr).href;
+                const isMediaTag = trimmed.startsWith("#EXT-X-MEDIA");
+                const endpoint = isMediaTag && (absUri.includes(".m3u8") || absUri.includes("m3u8-proxy"))
+                  ? "m3u8-proxy.m3u8"
+                  : "ts-proxy.ts";
                 return `URI="${proxyOrigin}/${endpoint}?url=${encodeURIComponent(absUri)}${extraParams}"`;
               } catch (e) {
                 return match;
@@ -216,6 +214,7 @@ export default {
             });
           }
 
+          // Plain URL line (Playlist variant OR Segment chunk)
           try {
             const absUri = new URL(trimmed, targetUrlStr).href;
             let endpoint = "ts-proxy.ts";
@@ -245,7 +244,7 @@ export default {
         });
       }
 
-      // 5. Binary Media Streaming for TS and MP4
+      // 5. Binary Media Streaming for TS and MP4 chunks
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
