@@ -73,11 +73,11 @@ function checkIs1EmbedOrigin(request) {
   const reqOrigin = request.headers.get("Origin") || "";
   const reqReferer = request.headers.get("Referer") || "";
 
-  const is1Embed = reqOrigin.includes("1embed.cc") || reqReferer.includes("1embed.cc");
+  const is1Embed = reqOrigin.includes("main.bcine.ru") || reqReferer.includes("1embed.cc");
 
   return {
     is1Embed,
-    allowedOrigin: is1Embed ? (reqOrigin || "https://1embed.cc") : "https://1embed.cc"
+    allowedOrigin: is1Embed ? (reqOrigin || "https://main.bcine.ru") : "https://main.bcine.ru"
   };
 }
 
