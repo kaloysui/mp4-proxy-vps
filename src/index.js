@@ -73,7 +73,7 @@ function checkIs1EmbedOrigin(request) {
   const reqOrigin = request.headers.get("Origin") || "";
   const reqReferer = request.headers.get("Referer") || "";
 
-  const is1Embed = reqOrigin.includes("main.bcine.ru") || reqReferer.includes("1embed.cc");
+  const is1Embed = reqOrigin.includes("main.bcine.ru") || reqReferer.includes("main.bcine.ru");
 
   return {
     is1Embed,
