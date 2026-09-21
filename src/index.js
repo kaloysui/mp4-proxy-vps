@@ -1,14 +1,9 @@
-// Secret Encryption Key for 1Embed Proxy
+// Secret Encryption Key for 1Embed / Bcine Proxy
 const STREAM_SECRET = '1embed_secret_2026';
 
-// In-Memory Short Key Store (8-character random tokens)
+// In-Memory Short Key Store with fallback
 const tokenStore = new Map();
-const MAX_CACHE_SIZE = 15000;
-
-// Rate Limiter Store for Non-1Embed requests (IP -> { count, startTime })
-const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW_MS = 60000; // 1 Minute window
-const MAX_EXTERNAL_REQUESTS = 2;    // Max 2 requests for non-1embed origins
+const MAX_CACHE_SIZE = 25000;
 
 function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
@@ -68,51 +63,43 @@ function saveToShortStore(payload) {
   return key;
 }
 
-// STRICT Domain Check: ONLY 1embed.cc is allowed
-function checkIs1EmbedOrigin(request) {
-  const reqOrigin = request.headers.get("Origin") || "";
-  const reqReferer = request.headers.get("Referer") || "";
+// Check kung gikan sa main.bcine.ru o allowed domains
+function isAllowedDomain(request) {
+  const reqOrigin = (request.headers.get("Origin") || "").toLowerCase();
+  const reqReferer = (request.headers.get("Referer") || "").toLowerCase();
+  const secFetchSite = request.headers.get("Sec-Fetch-Site") || "";
 
-  const is1Embed = reqOrigin.includes("main.bcine.ru") || reqReferer.includes("main.bcine.ru");
-
-  return {
-    is1Embed,
-    allowedOrigin: is1Embed ? (reqOrigin || "https://main.bcine.ru") : "https://main.bcine.ru"
-  };
-}
-
-// Rate Limiter (Applies strictly to external domains, limit = 2 per min)
-function checkRateLimit(clientIp) {
-  const now = Date.now();
-  const record = rateLimitMap.get(clientIp);
-
-  if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
-    rateLimitMap.set(clientIp, { count: 1, startTime: now });
-    return true; // Allowed
-  }
-
-  if (record.count >= MAX_EXTERNAL_REQUESTS) {
-    return false; // Rate limit exceeded (Max 2)
-  }
-
-  record.count += 1;
-  return true; // Allowed
+  // I-allow ang main.bcine.ru, bcine.ru, o standard media fetches
+  return (
+    reqOrigin.includes("bcine.ru") ||
+    reqReferer.includes("bcine.ru") ||
+    reqOrigin.includes("main.bcine.ru") ||
+    reqReferer.includes("main.bcine.ru") ||
+    reqOrigin.includes("localhost") ||
+    reqOrigin.includes("run.app") ||
+    secFetchSite === "cross-site" || 
+    !reqOrigin // Direct HLS TS media chunk requests
+  );
 }
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
-    const { is1Embed, allowedOrigin } = checkIs1EmbedOrigin(request);
+    const reqOrigin = request.headers.get("Origin") || "";
+
+    // 1. Strict & Clean CORS Headers (Auto-reflect Origin para walay CORS mismatch)
+    const allowedOriginHeader = reqOrigin || "https://main.bcine.ru";
 
     const corsHeaders = {
-      "Access-Control-Allow-Origin": allowedOrigin,
+      "Access-Control-Allow-Origin": allowedOriginHeader,
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Allow-Headers": "Range, DNT, User-Agent, X-Requested-With, If-Modified-Since, Cache-Control, Content-Type, Authorization",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition",
+      "Access-Control-Allow-Credentials": "true",
+      "Vary": "Origin, Access-Control-Request-Headers",
     };
 
-    // 1. CORS Preflight
+    // 2. Handle CORS Preflight (OPTIONS)
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -123,33 +110,30 @@ export default {
       });
     }
 
-    // 2. Strict Rate Limit for non-1embed.cc requests (Limit = 2)
-    if (!is1Embed) {
-      const allowed = checkRateLimit(clientIp);
-      if (!allowed) {
-        return new Response("Too Many Requests. Rate limit of 2 per minute reached for non-1embed.cc callers.", {
-          status: 429,
-          headers: corsHeaders,
-        });
-      }
+    // 3. Domain Protection (I-block lang ang mga external unauthorized scrapers nga dili bcine.ru)
+    if (!isAllowedDomain(request)) {
+      return new Response("Unauthorized Domain Access.", {
+        status: 403,
+        headers: corsHeaders,
+      });
     }
 
-    // Extract path key (e.g. "/a8x9z2k1.ts" -> "a8x9z2k1", "/token.m3u8" -> "token")
+    // Extract pathname key
     const pathname = url.pathname.substring(1);
     const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
 
     let payload = null;
 
-    // A. Check in-memory short key cache
+    // A. Check in-memory store
     if (pathKey && tokenStore.has(pathKey)) {
       payload = tokenStore.get(pathKey);
     } 
-    // B. Check if path is encrypted token
+    // B. Check if encrypted payload token
     else if (pathKey) {
       payload = unpackSync(pathKey);
     }
 
-    // C. Fallbacks for query params (?v=, ?d=, ?url=)
+    // C. Query Param Fallbacks
     if (!payload) {
       const qv = url.searchParams.get("v");
       const qd = url.searchParams.get("d");
@@ -168,22 +152,18 @@ export default {
       }
     }
 
-    // 3. Subtitle Conversion Endpoint (/vtt or /*.vtt)
+    // 4. Subtitle Endpoint
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
-        return new Response("Missing target subtitle parameter", {
-          status: 400,
-          headers: corsHeaders,
-        });
+        return new Response("Missing target subtitle parameter", { status: 400, headers: corsHeaders });
       }
 
       try {
         const subRes = await fetch(payload.u, {
           headers: {
-            "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
             "Referer": payload.r || new URL(payload.u).origin + "/",
             "Origin": payload.o || new URL(payload.u).origin,
-            "Accept-Language": "en-US,en;q=0.9",
           },
           redirect: "follow",
         });
@@ -212,9 +192,9 @@ export default {
       }
     }
 
-    // 4. Media Streaming Proxy
+    // 5. Default Response for health-check
     if (!payload || !payload.u) {
-      return new Response("1Embed Stream Proxy Active", {
+      return new Response("Bcine Stream Proxy Active (main.bcine.ru)", {
         status: 200,
         headers: {
           ...corsHeaders,
@@ -232,9 +212,8 @@ export default {
       const parsedHeaders = payload.h || {};
 
       const reqHeaders = new Headers();
-      reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
-      reqHeaders.set("Accept", request.headers.get("Accept") || "*/*");
-      reqHeaders.set("Accept-Language", request.headers.get("Accept-Language") || "en-US,en;q=0.9");
+      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
+      reqHeaders.set("Accept", "*/*");
       reqHeaders.set("Referer", referer);
       if (origin) reqHeaders.set("Origin", origin);
 
@@ -257,7 +236,13 @@ export default {
 
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
+      // Clean upstream CORS headers to avoid duplication conflicts
       const resHeaders = new Headers(proxyRes.headers);
+      resHeaders.delete("access-control-allow-origin");
+      resHeaders.delete("access-control-allow-methods");
+      resHeaders.delete("access-control-allow-headers");
+      resHeaders.delete("access-control-expose-headers");
+
       for (const [ck, cv] of Object.entries(corsHeaders)) {
         resHeaders.set(ck, cv);
       }
@@ -281,8 +266,6 @@ export default {
 
       if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
-        resHeaders.set("Pragma", "no-cache");
-        resHeaders.set("Expires", "0");
       } else {
         resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
       }
@@ -291,7 +274,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 5. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g. /{shortKey}.ts)
+      // 6. Rewrite M3U8 Playlists (Gamit ang encrypted token para dili mawala sa Cloudflare edge isolates)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -322,8 +305,9 @@ export default {
                 const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
                 const q = quote || '"';
                 
-                const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-                return `URI=${q}${proxyOrigin}/${key}.${ext}${q}`;
+                // Pack directly or use short token
+                const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+                return `URI=${q}${proxyOrigin}/${token}.${ext}${q}`;
               } catch (e) {
                 return match;
               }
@@ -343,8 +327,8 @@ export default {
             isNextStreamInf = false;
             isNextExtInf = false;
             
-            const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-            return `${proxyOrigin}/${key}.${ext}`;
+            const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+            return `${proxyOrigin}/${token}.${ext}`;
           } catch (e) {
             isNextStreamInf = false;
             isNextExtInf = false;
@@ -362,7 +346,7 @@ export default {
         });
       }
 
-      // 6. Binary Streaming
+      // 7. Video Chunk Stream
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
