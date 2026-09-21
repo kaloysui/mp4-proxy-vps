@@ -1,9 +1,13 @@
-// Secret Encryption Key for 1Embed / Bcine Proxy
+// Secret Encryption Key for Bcine Proxy
 const STREAM_SECRET = '1embed_secret_2026';
 
-// In-Memory Short Key Store with fallback
+// In-Memory Short Key Store with LRU cleanup
 const tokenStore = new Map();
 const MAX_CACHE_SIZE = 25000;
+
+// 24-Hour IP Rate Limiter Store (IP -> BannedUntilTimestamp)
+const bannedIpMap = new Map();
+const BAN_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Oras (1 Day) Cooldown
 
 function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
@@ -63,32 +67,93 @@ function saveToShortStore(payload) {
   return key;
 }
 
-// Check kung gikan sa main.bcine.ru o allowed domains
-function isAllowedDomain(request) {
+// Check kung gikan sa bcine.ru o main.bcine.ru
+function isBcineOrigin(request) {
   const reqOrigin = (request.headers.get("Origin") || "").toLowerCase();
   const reqReferer = (request.headers.get("Referer") || "").toLowerCase();
-  const secFetchSite = request.headers.get("Sec-Fetch-Site") || "";
 
-  // I-allow ang main.bcine.ru, bcine.ru, o standard media fetches
-  return (
+  const isBcine =
     reqOrigin.includes("bcine.ru") ||
     reqReferer.includes("bcine.ru") ||
     reqOrigin.includes("main.bcine.ru") ||
-    reqReferer.includes("main.bcine.ru") ||
-    reqOrigin.includes("localhost") ||
-    reqOrigin.includes("run.app") ||
-    secFetchSite === "cross-site" || 
-    !reqOrigin // Direct HLS TS media chunk requests
-  );
+    reqReferer.includes("main.bcine.ru");
+
+  // Kung gikan sa gawas nga domain
+  if (reqOrigin && !isBcine) return false;
+  if (reqReferer && !isBcine) return false;
+
+  return true;
+}
+
+// 24-Hour Cooldown Handler
+function handleCooldown(clientIp, isBcine) {
+  const now = Date.now();
+  
+  if (bannedIpMap.has(clientIp)) {
+    const bannedUntil = bannedIpMap.get(clientIp);
+    if (now < bannedUntil) {
+      return true; // Still in cooldown
+    } else {
+      bannedIpMap.delete(clientIp);
+    }
+  }
+
+  if (!isBcine) {
+    bannedIpMap.set(clientIp, now + BAN_DURATION_MS);
+    return true;
+  }
+
+  return false;
+}
+
+// Clean Honeypot Response para sa external scrapers
+function getBcineHoneypot(url, corsHeaders) {
+  if (url.pathname.endsWith(".m3u8")) {
+    const honeypotM3u8 = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+# Visit https://bcine.ru to watch
+#EXTINF:10.0,
+https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4
+#EXT-X-ENDLIST`;
+
+    return new Response(honeypotM3u8, {
+      status: 200,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+      },
+    });
+  }
+
+  if (url.pathname.includes("vtt")) {
+    return new Response("WEBVTT\n\n00:00:00.000 --> 00:10:00.000\nVisit bcine.ru to watch\n", {
+      status: 200,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "text/vtt; charset=utf-8",
+      },
+    });
+  }
+
+  return new Response("Visit bcine.ru to watch.", {
+    status: 200,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+  });
 }
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
     const reqOrigin = request.headers.get("Origin") || "";
 
-    // 1. Strict & Clean CORS Headers (Auto-reflect Origin para walay CORS mismatch)
-    const allowedOriginHeader = reqOrigin || "https://main.bcine.ru";
+    const allowedOriginHeader = reqOrigin.includes("bcine.ru") ? reqOrigin : "https://bcine.ru";
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": allowedOriginHeader,
@@ -99,7 +164,7 @@ export default {
       "Vary": "Origin, Access-Control-Request-Headers",
     };
 
-    // 2. Handle CORS Preflight (OPTIONS)
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -110,12 +175,12 @@ export default {
       });
     }
 
-    // 3. Domain Protection (I-block lang ang mga external unauthorized scrapers nga dili bcine.ru)
-    if (!isAllowedDomain(request)) {
-      return new Response("Unauthorized Domain Access.", {
-        status: 403,
-        headers: corsHeaders,
-      });
+    // 2. Domain Check & Honeypot Delivery
+    const isBcine = isBcineOrigin(request);
+    const isCooldownActive = handleCooldown(clientIp, isBcine);
+
+    if (isCooldownActive) {
+      return getBcineHoneypot(url, corsHeaders);
     }
 
     // Extract pathname key
@@ -124,16 +189,16 @@ export default {
 
     let payload = null;
 
-    // A. Check in-memory store
+    // A. In-memory check
     if (pathKey && tokenStore.has(pathKey)) {
       payload = tokenStore.get(pathKey);
     } 
-    // B. Check if encrypted payload token
+    // B. Encrypted token check
     else if (pathKey) {
       payload = unpackSync(pathKey);
     }
 
-    // C. Query Param Fallbacks
+    // C. Query Params
     if (!payload) {
       const qv = url.searchParams.get("v");
       const qd = url.searchParams.get("d");
@@ -152,10 +217,10 @@ export default {
       }
     }
 
-    // 4. Subtitle Endpoint
+    // 3. Subtitle Endpoint
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
-        return new Response("Missing target subtitle parameter", { status: 400, headers: corsHeaders });
+        return getBcineHoneypot(url, corsHeaders);
       }
 
       try {
@@ -188,13 +253,13 @@ export default {
           },
         });
       } catch (err) {
-        return new Response("Error converting subtitle: " + err.message, { status: 500, headers: corsHeaders });
+        return getBcineHoneypot(url, corsHeaders);
       }
     }
 
-    // 5. Default Response for health-check
+    // 4. Default Root / Status
     if (!payload || !payload.u) {
-      return new Response("Bcine Stream Proxy Active (main.bcine.ru)", {
+      return new Response("Visit bcine.ru to watch.", {
         status: 200,
         headers: {
           ...corsHeaders,
@@ -236,7 +301,7 @@ export default {
 
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
-      // Clean upstream CORS headers to avoid duplication conflicts
+      // Clean upstream headers
       const resHeaders = new Headers(proxyRes.headers);
       resHeaders.delete("access-control-allow-origin");
       resHeaders.delete("access-control-allow-methods");
@@ -274,7 +339,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 6. Rewrite M3U8 Playlists (Gamit ang encrypted token para dili mawala sa Cloudflare edge isolates)
+      // 5. Rewrite M3U8 Playlists using Encrypted Tokens
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -305,7 +370,6 @@ export default {
                 const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
                 const q = quote || '"';
                 
-                // Pack directly or use short token
                 const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
                 return `URI=${q}${proxyOrigin}/${token}.${ext}${q}`;
               } catch (e) {
@@ -346,17 +410,14 @@ export default {
         });
       }
 
-      // 7. Video Chunk Stream
+      // 6. Binary Video Delivery
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
         headers: resHeaders,
       });
     } catch (err) {
-      return new Response("Stream Proxy Error: " + err.message, {
-        status: 502,
-        headers: corsHeaders,
-      });
+      return getBcineHoneypot(url, corsHeaders);
     }
   },
 };
