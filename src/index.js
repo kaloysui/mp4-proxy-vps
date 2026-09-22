@@ -3,35 +3,28 @@ const STREAM_SECRET = '1embed_secret_2026';
 
 // In-Memory Short Key Store with LRU Cache
 const tokenStore = new Map();
-const MAX_CACHE_SIZE = 50000;
+const MAX_CACHE_SIZE = 30000;
 
-// 24-Hour IP Ban Map (IP -> Expiry Timestamp)
+// 24-Hour IP Ban / Cooldown Map (IP -> Expiry Timestamp)
 const bannedIpMap = new Map();
-const BAN_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Oras (1 Day Ban)
-
-// IP Rate Limiting Map (IP -> { count: number, resetAt: number })
-const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW_MS = 10 * 1000; // 10 seconds window
-const MAX_REQUESTS_PER_WINDOW = 200;    // Max 200 requests per 10 seconds
+const BAN_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Oras (1 Day)
 
 function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
 }
 
-// High-Performance Zero-Failure URL-Safe Base64 XOR Cipher
 function packSync(obj) {
   try {
-    const jsonStr = JSON.stringify(obj);
+    const json = JSON.stringify(obj);
     const encoder = new TextEncoder();
-    const data = encoder.encode(jsonStr);
-    const secret = encoder.encode(STREAM_SECRET);
-    const encrypted = new Uint8Array(data.length);
-    for (let i = 0; i < data.length; i++) {
-      encrypted[i] = data[i] ^ secret[i % secret.length];
+    const jsonBytes = encoder.encode(json);
+    const secretBytes = encoder.encode(STREAM_SECRET);
+    const encrypted = new Uint8Array(jsonBytes.length);
+    for (let i = 0; i < jsonBytes.length; i++) {
+      encrypted[i] = jsonBytes[i] ^ secretBytes[i % secretBytes.length];
     }
     let binary = '';
-    const len = encrypted.byteLength;
-    for (let i = 0; i < len; i++) {
+    for (let i = 0; i < encrypted.length; i++) {
       binary += String.fromCharCode(encrypted[i]);
     }
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -51,13 +44,14 @@ function unpackSync(token) {
       bytes[i] = binary.charCodeAt(i);
     }
     const encoder = new TextEncoder();
-    const secret = encoder.encode(STREAM_SECRET);
+    const secretBytes = encoder.encode(STREAM_SECRET);
     const decrypted = new Uint8Array(bytes.length);
     for (let i = 0; i < bytes.length; i++) {
-      decrypted[i] = bytes[i] ^ secret[i % secret.length];
+      decrypted[i] = bytes[i] ^ secretBytes[i % secretBytes.length];
     }
     const decoder = new TextDecoder();
-    return JSON.parse(decoder.decode(decrypted));
+    const json = decoder.decode(decrypted);
+    return JSON.parse(json);
   } catch (e) {
     return null;
   }
@@ -73,25 +67,21 @@ function saveToShortStore(payload) {
   return key;
 }
 
-// Hugot nga pagsusi: main.bcine.ru ug bcine.ru LAMANG ang gitugotan
+// Check kung lehitimong gikan sa main.bcine.ru o bcine.ru
 function isAuthorizedOrigin(request) {
   const reqOrigin = (request.headers.get("Origin") || "").toLowerCase();
   const reqReferer = (request.headers.get("Referer") || "").toLowerCase();
 
-  // Kung naay gawas nga origin o referer nga dili bcine.ru -> Block/Ban dayon
-  if (reqOrigin && !reqOrigin.includes("bcine.ru") && !reqOrigin.includes("main.bcine.ru")) {
-    return false;
-  }
-  if (reqReferer && !reqReferer.includes("bcine.ru") && !reqReferer.includes("main.bcine.ru")) {
-    return false;
-  }
+  const isBcine =
+    reqOrigin.includes("main.bcine.ru") ||
+    reqReferer.includes("main.bcine.ru") ||
+    reqOrigin.includes("bcine.ru") ||
+    reqReferer.includes("bcine.ru");
 
-  // Kung lehitimong gikan sa bcine.ru o main.bcine.ru
-  if (reqOrigin.includes("bcine.ru") || reqReferer.includes("bcine.ru")) {
-    return true;
-  }
+  // Kung naay gawas nga domain (external scraper / unlisted site)
+  if (reqOrigin && !isBcine) return false;
+  if (reqReferer && !isBcine) return false;
 
-  // Kung video chunk fetch nga walay origin/referer (standard HTML5 video player requests)
   return true;
 }
 
@@ -102,9 +92,9 @@ function handleBanCheck(clientIp, isAuthorized) {
   if (bannedIpMap.has(clientIp)) {
     const bannedUntil = bannedIpMap.get(clientIp);
     if (now < bannedUntil) {
-      return true; // Na-ban pa sulod sa 24 oras
+      return true; // Still banned
     } else {
-      bannedIpMap.delete(clientIp);
+      bannedIpMap.delete(clientIp); // Expired
     }
   }
 
@@ -116,33 +106,13 @@ function handleBanCheck(clientIp, isAuthorized) {
   return false;
 }
 
-// Sliding-Window IP Rate Limiter
-function checkRateLimit(clientIp) {
-  const now = Date.now();
-  const entry = rateLimitMap.get(clientIp);
-
-  if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(clientIp, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
-    return true;
-  }
-
-  entry.count += 1;
-  if (entry.count > MAX_REQUESTS_PER_WINDOW) {
-    // I-ban dayon ang IP sulod sa 24 oras kung mag-spam
-    bannedIpMap.set(clientIp, now + BAN_DURATION_MS);
-    return false;
-  }
-
-  return true;
-}
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
     const reqOrigin = request.headers.get("Origin") || "";
 
-    // 1. Strict CORS Headers para sa main.bcine.ru ug bcine.ru
+    // 1. Strict CORS Headers para sa main.bcine.ru
     const allowedOrigin = reqOrigin.includes("bcine.ru") ? reqOrigin : "https://main.bcine.ru";
 
     const corsHeaders = {
@@ -165,12 +135,12 @@ export default {
       });
     }
 
-    // 3. Strict Domain Check & 24-Hour IP Ban
+    // 3. Domain Check & 24-Hour Ban
     const isAuthorized = isAuthorizedOrigin(request);
     const isBanned = handleBanCheck(clientIp, isAuthorized);
 
     if (isBanned) {
-      return new Response("Visit main.bcine.ru to watch.", {
+      return new Response("Visit bcine.ru to watch.", {
         status: 403,
         headers: {
           ...corsHeaders,
@@ -179,65 +149,31 @@ export default {
       });
     }
 
-    // 4. Rate Limit Check
-    const rateOk = checkRateLimit(clientIp);
-    if (!rateOk) {
-      return new Response("Visit main.bcine.ru to watch.", {
-        status: 429,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/plain; charset=utf-8",
-        },
-      });
-    }
-
-    // Extract Path Key (handles .m3u8, .ts, .mp4, .key, .vtt, .m4s, .mpd)
+    // Extract Path Key
     const pathname = url.pathname.substring(1);
-    const pathKey = pathname.replace(/\.(m3u8|ts|mp4|key|vtt|m4s|mpd)$/i, '');
+    const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
 
     let payload = null;
 
-    // A. Check encrypted token first
-    if (pathKey) {
+    // A. Check in-memory store
+    if (pathKey && tokenStore.has(pathKey)) {
+      payload = tokenStore.get(pathKey);
+    } 
+    // B. Check if encrypted payload token
+    else if (pathKey) {
       payload = unpackSync(pathKey);
     }
 
-    // B. Check random short key in-memory store
-    if (!payload && pathKey && tokenStore.has(pathKey)) {
-      payload = tokenStore.get(pathKey);
-    }
-
-    // C. Check multi-segment subpath para sa DASH .m4s chunks
-    if (!payload && pathname.includes('/')) {
-      const parts = pathname.split('/');
-      const baseToken = parts[0].replace(/\.(m3u8|ts|mp4|key|vtt|m4s|mpd)$/i, '');
-      const basePayload = unpackSync(baseToken) || (tokenStore.has(baseToken) ? tokenStore.get(baseToken) : null);
-      if (basePayload && basePayload.u) {
-        const subPath = parts.slice(1).join('/');
-        let targetUrl = basePayload.u;
-        if (targetUrl.endsWith('/')) {
-          targetUrl += subPath;
-        } else {
-          const lastSlash = targetUrl.lastIndexOf('/');
-          targetUrl = (lastSlash !== -1 ? targetUrl.substring(0, lastSlash + 1) : targetUrl + '/') + subPath;
-        }
-        payload = {
-          ...basePayload,
-          u: targetUrl,
-        };
-      }
-    }
-
-    // D. Query params fallback
+    // C. Query Params fallback
     if (!payload) {
-      const qd = url.searchParams.get("d");
       const qv = url.searchParams.get("v");
+      const qd = url.searchParams.get("d");
       const qurl = url.searchParams.get("url");
 
-      if (qd) {
-        payload = unpackSync(qd);
-      } else if (qv && tokenStore.has(qv)) {
+      if (qv && tokenStore.has(qv)) {
         payload = tokenStore.get(qv);
+      } else if (qd) {
+        payload = unpackSync(qd);
       } else if (qurl) {
         payload = {
           u: qurl,
@@ -247,16 +183,16 @@ export default {
       }
     }
 
-    // 5. Subtitle Endpoint
+    // 4. Subtitle Endpoint with 24-Hour Edge Caching
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
-        return new Response("Missing subtitle payload", { status: 400, headers: corsHeaders });
+        return new Response("Visit bcine.ru to watch.", { status: 400, headers: corsHeaders });
       }
 
       try {
         const subRes = await fetch(payload.u, {
           headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
             "Referer": payload.r || new URL(payload.u).origin + "/",
             "Origin": payload.o || new URL(payload.u).origin,
           },
@@ -284,13 +220,13 @@ export default {
           },
         });
       } catch (err) {
-        return new Response("Subtitle error", { status: 500, headers: corsHeaders });
+        return new Response("Visit bcine.ru to watch.", { status: 500, headers: corsHeaders });
       }
     }
 
-    // 6. Default Health Check
+    // 5. Default Health Check
     if (!payload || !payload.u) {
-      return new Response("Visit main.bcine.ru to watch.", {
+      return new Response("Visit bcine.ru to watch.", {
         status: 200,
         headers: {
           ...corsHeaders,
@@ -308,13 +244,13 @@ export default {
       const parsedHeaders = payload.h || {};
 
       const reqHeaders = new Headers();
-      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
+      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
       reqHeaders.set("Accept", "*/*");
       reqHeaders.set("Referer", referer);
       if (origin) reqHeaders.set("Origin", origin);
 
       for (const [key, value] of Object.entries(parsedHeaders)) {
-        if (!["referer", "origin", "user-agent", "host", "connection", "accept-encoding"].includes(key.toLowerCase())) {
+        if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
           reqHeaders.set(key, String(value));
         }
       }
@@ -324,11 +260,10 @@ export default {
         reqHeaders.set("Range", rangeHeader);
       }
 
-      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4") || url.pathname.endsWith(".m4s");
+      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4");
       const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
-      const isExplicitMPD = url.pathname.endsWith(".mpd");
 
-      // Video Chunks & Streams Fetch
+      // TURBO FETCH: I-cache ang video chunks sa Cloudflare Edge CDN aron makatipid og bandwidth ug paspas ang load
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
@@ -338,27 +273,23 @@ export default {
 
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
+      // Clean upstream CORS headers
       const resHeaders = new Headers(proxyRes.headers);
       resHeaders.delete("access-control-allow-origin");
       resHeaders.delete("access-control-allow-methods");
       resHeaders.delete("access-control-allow-headers");
       resHeaders.delete("access-control-expose-headers");
-      resHeaders.delete("content-security-policy");
-      resHeaders.delete("x-frame-options");
 
       for (const [ck, cv] of Object.entries(corsHeaders)) {
         resHeaders.set(ck, cv);
       }
 
       let contentType = resHeaders.get("Content-Type") || "";
-      const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL") || contentType.includes("application/vnd.apple.mpegurl"));
-      const isMPD = !isExplicitSegment && (isExplicitMPD || contentType.includes("dash+xml") || contentType.includes("application/dash+xml"));
+      const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
 
       if (isM3U8) {
-        contentType = "application/vnd.apple.mpegurl; charset=utf-8";
-      } else if (isMPD) {
-        contentType = "application/dash+xml; charset=utf-8";
-      } else if (contentType.includes("mp4") || contentType.includes("video/iso.segment") || url.pathname.endsWith(".mp4") || url.pathname.endsWith(".m4s")) {
+        contentType = "application/vnd.apple.mpegurl";
+      } else if (contentType.includes("mp4") || contentType.includes("video/iso.segment") || url.pathname.endsWith(".mp4")) {
         contentType = "video/mp4";
       } else if (isExplicitSegment || contentType.includes("mp2t") || contentType.includes("video/ts")) {
         contentType = "video/mp2t";
@@ -367,9 +298,10 @@ export default {
       resHeaders.set("Content-Type", contentType);
       resHeaders.set("Content-Disposition", "inline");
 
-      if (isM3U8 || isMPD) {
+      if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
       } else {
+        // High-Speed Edge & Browser Caching para sa video segments
         resHeaders.set("Cache-Control", "public, max-age=604800, s-maxage=604800, immutable");
       }
 
@@ -377,40 +309,7 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      if (request.method === "HEAD") {
-        return new Response(null, {
-          status: proxyRes.status,
-          statusText: proxyRes.statusText,
-          headers: resHeaders,
-        });
-      }
-
-      // 7. Rewrite DASH MPD Manifests
-      if (isMPD && proxyRes.ok) {
-        let mpdText = await proxyRes.text();
-        const proxyOrigin = url.origin;
-
-        const baseDir = finalResolvedUrl.substring(0, finalResolvedUrl.lastIndexOf('/') + 1);
-        const baseToken = packSync({ u: baseDir, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: baseDir, r: referer, o: origin, h: parsedHeaders });
-        const proxyBaseUrl = `${proxyOrigin}/${baseToken}/`;
-
-        if (/<BaseURL[^>]*>/i.test(mpdText)) {
-          mpdText = mpdText.replace(/<BaseURL[^>]*>.*?<\/BaseURL>/gi, `<BaseURL>${proxyBaseUrl}</BaseURL>`);
-        } else {
-          mpdText = mpdText.replace(/(<MPD[^>]*>)/i, `$1\n  <BaseURL>${proxyBaseUrl}</BaseURL>`);
-        }
-
-        resHeaders.delete("Content-Encoding");
-        resHeaders.delete("Content-Length");
-
-        return new Response(mpdText, {
-          status: proxyRes.status,
-          statusText: proxyRes.statusText,
-          headers: resHeaders,
-        });
-      }
-
-      // 8. Rewrite M3U8 Playlists
+      // 6. Rewrite M3U8 Playlists using Fast Encrypted Tokens
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -437,16 +336,10 @@ export default {
               if (!rawUri) return match;
               try {
                 const absUri = new URL(rawUri, finalResolvedUrl).href;
-                const isKey = trimmed.startsWith("#EXT-X-KEY");
-                const isMap = trimmed.startsWith("#EXT-X-MAP");
                 const isMedia = trimmed.startsWith("#EXT-X-MEDIA");
-                
-                let ext = "ts";
-                if (isKey) ext = "key";
-                else if (isMap) ext = "mp4";
-                else if (isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8"))) ext = "m3u8";
-
+                const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
                 const q = quote || '"';
+                
                 const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
                 return `URI=${q}${proxyOrigin}/${token}.${ext}${q}`;
               } catch (e) {
@@ -455,13 +348,14 @@ export default {
             });
           }
 
+          // Content Line
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
             let ext = "ts";
-            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("cdn-m3u8") || absUri.includes("/hls/")) {
+            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) {
               ext = "m3u8";
             } else if (isNextExtInf) {
-              ext = absUri.includes(".mp4") ? "mp4" : "ts";
+              ext = "ts";
             }
 
             isNextStreamInf = false;
@@ -486,14 +380,14 @@ export default {
         });
       }
 
-      // 9. Video Chunk Stream Delivery
+      // 7. Video Chunk Stream Delivery
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
         headers: resHeaders,
       });
     } catch (err) {
-      return new Response("Visit main.bcine.ru to watch.", {
+      return new Response("Visit bcine.ru to watch.", {
         status: 502,
         headers: corsHeaders,
       });
