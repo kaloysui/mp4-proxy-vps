@@ -13,18 +13,20 @@ function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
 }
 
+// High-Performance Zero-Failure URL-Safe Base64 XOR Cipher
 function packSync(obj) {
   try {
-    const json = JSON.stringify(obj);
+    const jsonStr = JSON.stringify(obj);
     const encoder = new TextEncoder();
-    const jsonBytes = encoder.encode(json);
-    const secretBytes = encoder.encode(STREAM_SECRET);
-    const encrypted = new Uint8Array(jsonBytes.length);
-    for (let i = 0; i < jsonBytes.length; i++) {
-      encrypted[i] = jsonBytes[i] ^ secretBytes[i % secretBytes.length];
+    const data = encoder.encode(jsonStr);
+    const secret = encoder.encode(STREAM_SECRET);
+    const encrypted = new Uint8Array(data.length);
+    for (let i = 0; i < data.length; i++) {
+      encrypted[i] = data[i] ^ secret[i % secret.length];
     }
     let binary = '';
-    for (let i = 0; i < encrypted.length; i++) {
+    const len = encrypted.byteLength;
+    for (let i = 0; i < len; i++) {
       binary += String.fromCharCode(encrypted[i]);
     }
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -44,10 +46,10 @@ function unpackSync(token) {
       bytes[i] = binary.charCodeAt(i);
     }
     const encoder = new TextEncoder();
-    const secretBytes = encoder.encode(STREAM_SECRET);
+    const secret = encoder.encode(STREAM_SECRET);
     const decrypted = new Uint8Array(bytes.length);
     for (let i = 0; i < bytes.length; i++) {
-      decrypted[i] = bytes[i] ^ secretBytes[i % secretBytes.length];
+      decrypted[i] = bytes[i] ^ secret[i % secret.length];
     }
     const decoder = new TextDecoder();
     return JSON.parse(decoder.decode(decrypted));
@@ -154,29 +156,30 @@ export default {
 
     // Extract Path Key
     const pathname = url.pathname.substring(1);
-    const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
+    const pathKey = pathname.replace(/\.(m3u8|ts|mp4|key|vtt)$/i, '');
 
     let payload = null;
 
-    // A. Check in-memory store
-    if (pathKey && tokenStore.has(pathKey)) {
-      payload = tokenStore.get(pathKey);
-    } 
-    // B. Check if encrypted payload token
-    else if (pathKey) {
+    // A. Check encrypted payload token first (distributed across all Edge nodes)
+    if (pathKey) {
       payload = unpackSync(pathKey);
     }
 
+    // B. Check in-memory store fallback
+    if (!payload && pathKey && tokenStore.has(pathKey)) {
+      payload = tokenStore.get(pathKey);
+    } 
+
     // C. Query Params fallback
     if (!payload) {
-      const qv = url.searchParams.get("v");
       const qd = url.searchParams.get("d");
+      const qv = url.searchParams.get("v");
       const qurl = url.searchParams.get("url");
 
-      if (qv && tokenStore.has(qv)) {
-        payload = tokenStore.get(qv);
-      } else if (qd) {
+      if (qd) {
         payload = unpackSync(qd);
+      } else if (qv && tokenStore.has(qv)) {
+        payload = tokenStore.get(qv);
       } else if (qurl) {
         payload = {
           u: qurl,
@@ -195,7 +198,7 @@ export default {
       try {
         const subRes = await fetch(payload.u, {
           headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
             "Referer": payload.r || new URL(payload.u).origin + "/",
             "Origin": payload.o || new URL(payload.u).origin,
           },
@@ -247,13 +250,13 @@ export default {
       const parsedHeaders = payload.h || {};
 
       const reqHeaders = new Headers();
-      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
+      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
       reqHeaders.set("Accept", "*/*");
       reqHeaders.set("Referer", referer);
       if (origin) reqHeaders.set("Origin", origin);
 
       for (const [key, value] of Object.entries(parsedHeaders)) {
-        if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
+        if (!["referer", "origin", "user-agent", "host", "connection", "accept-encoding"].includes(key.toLowerCase())) {
           reqHeaders.set(key, String(value));
         }
       }
@@ -266,7 +269,7 @@ export default {
       const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4");
       const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
 
-      // TURBO FETCH: I-cache ang video chunks sa Edge CDN aron paspas ang buffer
+      // TURBO FETCH: Cache video chunks at Cloudflare Edge to prevent playback cancellation
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
@@ -276,22 +279,24 @@ export default {
 
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
-      // Clean upstream CORS headers
+      // Clean upstream CORS headers to avoid duplicate header conflicts
       const resHeaders = new Headers(proxyRes.headers);
       resHeaders.delete("access-control-allow-origin");
       resHeaders.delete("access-control-allow-methods");
       resHeaders.delete("access-control-allow-headers");
       resHeaders.delete("access-control-expose-headers");
+      resHeaders.delete("content-security-policy");
+      resHeaders.delete("x-frame-options");
 
       for (const [ck, cv] of Object.entries(corsHeaders)) {
         resHeaders.set(ck, cv);
       }
 
       let contentType = resHeaders.get("Content-Type") || "";
-      const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
+      const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL") || contentType.includes("application/vnd.apple.mpegurl"));
 
       if (isM3U8) {
-        contentType = "application/vnd.apple.mpegurl";
+        contentType = "application/vnd.apple.mpegurl; charset=utf-8";
       } else if (contentType.includes("mp4") || contentType.includes("video/iso.segment") || url.pathname.endsWith(".mp4")) {
         contentType = "video/mp4";
       } else if (isExplicitSegment || contentType.includes("mp2t") || contentType.includes("video/ts")) {
@@ -304,7 +309,6 @@ export default {
       if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
       } else {
-        // High-Speed Edge & Browser Caching para sa video segments
         resHeaders.set("Cache-Control", "public, max-age=604800, s-maxage=604800, immutable");
       }
 
@@ -312,7 +316,16 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 6. Rewrite M3U8 Playlists using Fast Encrypted Tokens
+      // Handle HEAD request gracefully (Prevents player abort)
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: proxyRes.status,
+          statusText: proxyRes.statusText,
+          headers: resHeaders,
+        });
+      }
+
+      // 6. Rewrite M3U8 Playlists using Self-Contained Encrypted Tokens
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -334,15 +347,22 @@ export default {
               isNextStreamInf = false;
             }
 
+            // Rewrite URI tags inside #EXT-X-MEDIA, #EXT-X-KEY, #EXT-X-MAP
             return line.replace(/URI=(["'])(.*?)\1|URI=([^\s,]+)/gi, (match, quote, p1, p2) => {
               const rawUri = p1 || p2;
               if (!rawUri) return match;
               try {
                 const absUri = new URL(rawUri, finalResolvedUrl).href;
+                const isKey = trimmed.startsWith("#EXT-X-KEY");
+                const isMap = trimmed.startsWith("#EXT-X-MAP");
                 const isMedia = trimmed.startsWith("#EXT-X-MEDIA");
-                const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
-                const q = quote || '"';
                 
+                let ext = "ts";
+                if (isKey) ext = "key";
+                else if (isMap) ext = "mp4";
+                else if (isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8"))) ext = "m3u8";
+
+                const q = quote || '"';
                 const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
                 return `URI=${q}${proxyOrigin}/${token}.${ext}${q}`;
               } catch (e) {
@@ -351,14 +371,14 @@ export default {
             });
           }
 
-          // Content Line
+          // Content Segments / Child Playlist Lines
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
             let ext = "ts";
-            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) {
+            if (isNextStreamInf || absUri.includes(".m3u8") || absUri.includes("cdn-m3u8") || absUri.includes("/hls/")) {
               ext = "m3u8";
             } else if (isNextExtInf) {
-              ext = "ts";
+              ext = absUri.includes(".mp4") ? "mp4" : "ts";
             }
 
             isNextStreamInf = false;
