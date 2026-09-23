@@ -1,13 +1,14 @@
-// Secret Encryption Key for Bcine / NetPlayer Proxy
+// Secret Encryption Key for 1Embed Proxy
 const STREAM_SECRET = '1embed_secret_2026';
 
-// In-Memory Short Key Store with LRU Cache
+// In-Memory Short Key Store (8-character random tokens)
 const tokenStore = new Map();
-const MAX_CACHE_SIZE = 30000;
+const MAX_CACHE_SIZE = 15000;
 
-// 24-Hour IP Ban / Cooldown Map (IP -> Expiry Timestamp)
-const bannedIpMap = new Map();
-const BAN_DURATION_MS = 24 * 60 * 60 * 1000; // 24 Oras (1 Day)
+// Rate Limiter Store for Non-Allowed requests (IP -> { count, startTime })
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 Minute window
+const MAX_EXTERNAL_REQUESTS = 2;    // Max 2 requests for non-whitelisted origins
 
 function generateShortKey() {
   return Math.random().toString(36).substring(2, 10);
@@ -67,69 +68,58 @@ function saveToShortStore(payload) {
   return key;
 }
 
-// Check kung lehitimong gikan sa bcine o authorized player origin
-function isAuthorizedOrigin(request) {
-  const reqOrigin = (request.headers.get("Origin") || "").toLowerCase();
-  const reqReferer = (request.headers.get("Referer") || "").toLowerCase();
+// STRICT Domain Check: ONLY 1embed.cc and main.bcine.ru are allowed
+function checkIsAllowedOrigin(request) {
+  const reqOrigin = request.headers.get("Origin") || "";
+  const reqReferer = request.headers.get("Referer") || "";
 
-  // If request has no Origin/Referer (direct media tag or proxy request from browser), allow
-  if (!reqOrigin && !reqReferer) return true;
+  const is1Embed = reqOrigin.includes("1embed.cc") || reqReferer.includes("1embed.cc");
+  const isBcine = reqOrigin.includes("main.bcine.ru") || reqReferer.includes("main.bcine.ru");
+  const isAllowed = is1Embed || isBcine;
 
-  const isBcine =
-    reqOrigin.includes("main.bcine.ru") ||
-    reqReferer.includes("main.bcine.ru") ||
-    reqOrigin.includes("bcine.ru") ||
-    reqReferer.includes("bcine.ru") ||
-    reqOrigin.includes("localhost") ||
-    reqReferer.includes("localhost") ||
-    reqOrigin.includes("run.app") ||
-    reqReferer.includes("run.app");
+  let fallbackOrigin = "https://1embed.cc";
+  if (isBcine) {
+    fallbackOrigin = "https://main.bcine.ru";
+  }
 
-  if (!isBcine && (reqOrigin || reqReferer)) return false;
-
-  return true;
+  return {
+    isAllowed,
+    allowedOrigin: isAllowed ? (reqOrigin || fallbackOrigin) : "https://1embed.cc"
+  };
 }
 
-// 24-Hour Banning System para sa external abusers
-function handleBanCheck(clientIp, isAuthorized) {
+// Rate Limiter (Applies strictly to external domains, limit = 2 per min)
+function checkRateLimit(clientIp) {
   const now = Date.now();
-  
-  if (bannedIpMap.has(clientIp)) {
-    const bannedUntil = bannedIpMap.get(clientIp);
-    if (now < bannedUntil) {
-      return true; // Still banned
-    } else {
-      bannedIpMap.delete(clientIp); // Expired
-    }
+  const record = rateLimitMap.get(clientIp);
+
+  if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
+    rateLimitMap.set(clientIp, { count: 1, startTime: now });
+    return true; // Allowed
   }
 
-  if (!isAuthorized) {
-    bannedIpMap.set(clientIp, now + BAN_DURATION_MS);
-    return true;
+  if (record.count >= MAX_EXTERNAL_REQUESTS) {
+    return false; // Rate limit exceeded (Max 2)
   }
 
-  return false;
+  record.count += 1;
+  return true; // Allowed
 }
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
-    const reqOrigin = request.headers.get("Origin") || "";
-
-    // 1. Dynamic CORS Headers
-    const allowedOrigin = reqOrigin || "*";
+    const { isAllowed, allowedOrigin } = checkIsAllowedOrigin(request);
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": allowedOrigin,
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Range, DNT, User-Agent, X-Requested-With, If-Modified-Since, Cache-Control, Content-Type, Authorization, Accept",
+      "Access-Control-Allow-Headers": "*",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition",
-      "Access-Control-Allow-Credentials": "true",
-      "Vary": "Origin, Access-Control-Request-Headers",
     };
 
-    // 2. CORS Preflight (OPTIONS)
+    // 1. CORS Preflight
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -140,36 +130,33 @@ export default {
       });
     }
 
-    // 3. Domain Check & 24-Hour Ban
-    const isAuthorized = isAuthorizedOrigin(request);
-    const isBanned = handleBanCheck(clientIp, isAuthorized);
-
-    if (isBanned) {
-      return new Response("Visit bcine.ru to watch.", {
-        status: 403,
-        headers: {
-          ...corsHeaders,
-          "Content-Type": "text/plain; charset=utf-8",
-        },
-      });
+    // 2. Strict Rate Limit for non-whitelisted callers (Limit = 2)
+    if (!isAllowed) {
+      const allowed = checkRateLimit(clientIp);
+      if (!allowed) {
+        return new Response("Too Many Requests. Rate limit of 2 per minute reached for unauthorized callers.", {
+          status: 429,
+          headers: corsHeaders,
+        });
+      }
     }
 
-    // Extract Path Key
+    // Extract path key (e.g. "/a8x9z2k1.ts" -> "a8x9z2k1", "/token.m3u8" -> "token")
     const pathname = url.pathname.substring(1);
     const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
 
     let payload = null;
 
-    // A. Check in-memory store
+    // A. Check in-memory short key cache
     if (pathKey && tokenStore.has(pathKey)) {
       payload = tokenStore.get(pathKey);
     } 
-    // B. Check if encrypted payload token
+    // B. Check if path is encrypted token
     else if (pathKey) {
       payload = unpackSync(pathKey);
     }
 
-    // C. Query Params fallback
+    // C. Fallbacks for query params (?v=, ?d=, ?url=)
     if (!payload) {
       const qv = url.searchParams.get("v");
       const qd = url.searchParams.get("d");
@@ -188,20 +175,23 @@ export default {
       }
     }
 
-    // 4. Subtitle Endpoint with 24-Hour Edge Caching
+    // 3. Subtitle Conversion Endpoint (/vtt or /*.vtt)
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
-        return new Response("Invalid subtitle request", { status: 400, headers: corsHeaders });
+        return new Response("Missing target subtitle parameter", {
+          status: 400,
+          headers: corsHeaders,
+        });
       }
 
       try {
         const subRes = await fetch(payload.u, {
           headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
+            "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36",
             "Referer": payload.r || new URL(payload.u).origin + "/",
             "Origin": payload.o || new URL(payload.u).origin,
+            "Accept-Language": "en-US,en;q=0.9",
           },
-          cf: { cacheEverything: true, cacheTtl: 86400 },
           redirect: "follow",
         });
 
@@ -221,17 +211,17 @@ export default {
           headers: {
             ...corsHeaders,
             "Content-Type": "text/vtt; charset=utf-8",
-            "Cache-Control": "public, max-age=86400, s-maxage=86400",
+            "Cache-Control": "public, max-age=86400",
           },
         });
       } catch (err) {
-        return new Response("Failed to fetch subtitle", { status: 500, headers: corsHeaders });
+        return new Response("Error converting subtitle: " + err.message, { status: 500, headers: corsHeaders });
       }
     }
 
-    // 5. Default Health Check
+    // 4. Media Streaming Proxy
     if (!payload || !payload.u) {
-      return new Response("Visit bcine.ru to watch.", {
+      return new Response("1Embed Stream Proxy Active", {
         status: 200,
         headers: {
           ...corsHeaders,
@@ -244,25 +234,15 @@ export default {
       const targetUrlStr = payload.u;
       const initialTarget = new URL(targetUrlStr);
 
-      // Automatic Referer & Origin para sa Yoru (films365 / xdownloaderx / xstreamx) ug uban pang sources
-      let referer = payload.r || "";
-      let origin = payload.o || "";
-
-      const lowerTarget = targetUrlStr.toLowerCase();
-      if (lowerTarget.includes("films365") || lowerTarget.includes("xdownloaderx") || lowerTarget.includes("xstreamx")) {
-        referer = referer || "https://www.films365.org/";
-        origin = origin || "https://www.films365.org";
-      } else {
-        referer = referer || initialTarget.origin + "/";
-        origin = origin || initialTarget.origin;
-      }
-
+      const referer = payload.r || initialTarget.origin + "/";
+      const origin = payload.o || initialTarget.origin;
       const parsedHeaders = payload.h || {};
 
       const reqHeaders = new Headers();
-      reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
-      reqHeaders.set("Accept", "*/*");
-      if (referer) reqHeaders.set("Referer", referer);
+      reqHeaders.set("User-Agent", request.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
+      reqHeaders.set("Accept", request.headers.get("Accept") || "*/*");
+      reqHeaders.set("Accept-Language", request.headers.get("Accept-Language") || "en-US,en;q=0.9");
+      reqHeaders.set("Referer", referer);
       if (origin) reqHeaders.set("Origin", origin);
 
       for (const [key, value] of Object.entries(parsedHeaders)) {
@@ -271,39 +251,28 @@ export default {
         }
       }
 
-      // RANGE HEADER HANDLING: I-pass ang Range header para sa fast seeking ug 206 Partial Content
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
       }
 
-      const isExplicitSegment = url.pathname.endsWith(".ts");
-      const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
-
-      // Ayaw i-cache ang Range requests o MP4 files aron dili ma-block ang 206 status ug seeking
-      const shouldEdgeCache = isExplicitSegment && !rangeHeader;
-
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
-        cf: shouldEdgeCache ? { cacheEverything: true, cacheTtl: 86400 * 7 } : { cacheEverything: false },
         redirect: "follow",
       });
 
       const finalResolvedUrl = proxyRes.url || targetUrlStr;
 
-      // Clean upstream CORS headers
       const resHeaders = new Headers(proxyRes.headers);
-      resHeaders.delete("access-control-allow-origin");
-      resHeaders.delete("access-control-allow-methods");
-      resHeaders.delete("access-control-allow-headers");
-      resHeaders.delete("access-control-expose-headers");
-
       for (const [ck, cv] of Object.entries(corsHeaders)) {
         resHeaders.set(ck, cv);
       }
 
+      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4");
+      const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
       let contentType = resHeaders.get("Content-Type") || "";
+
       const isM3U8 = !isExplicitSegment && (isExplicitM3U8 || contentType.includes("mpegurl") || contentType.includes("application/x-mpegURL"));
 
       if (isM3U8) {
@@ -319,16 +288,17 @@ export default {
 
       if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+        resHeaders.set("Pragma", "no-cache");
+        resHeaders.set("Expires", "0");
       } else {
-        resHeaders.set("Cache-Control", "public, max-age=604800, s-maxage=604800");
+        resHeaders.set("Cache-Control", "public, max-age=31536000, immutable");
       }
 
-      // Siguruha nga naka-set ang Accept-Ranges para sa browser video player
       if (!resHeaders.get("Accept-Ranges")) {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 6. Rewrite M3U8 Playlists using Fast Encrypted Tokens
+      // 5. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g. /{shortKey}.ts)
       if (isM3U8 && proxyRes.ok) {
         const playlistText = await proxyRes.text();
         const proxyOrigin = url.origin;
@@ -359,8 +329,8 @@ export default {
                 const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
                 const q = quote || '"';
                 
-                const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-                return `URI=${q}${proxyOrigin}/${token}.${ext}${q}`;
+                const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+                return `URI=${q}${proxyOrigin}/${key}.${ext}${q}`;
               } catch (e) {
                 return match;
               }
@@ -380,8 +350,8 @@ export default {
             isNextStreamInf = false;
             isNextExtInf = false;
             
-            const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders }) || saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-            return `${proxyOrigin}/${token}.${ext}`;
+            const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+            return `${proxyOrigin}/${key}.${ext}`;
           } catch (e) {
             isNextStreamInf = false;
             isNextExtInf = false;
@@ -399,14 +369,14 @@ export default {
         });
       }
 
-      // 7. Video Chunk / 206 Partial Content Stream Delivery
+      // 6. Binary Streaming
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
         headers: resHeaders,
       });
     } catch (err) {
-      return new Response("Visit bcine.ru to watch.", {
+      return new Response("Stream Proxy Error: " + err.message, {
         status: 502,
         headers: corsHeaders,
       });
