@@ -1,4 +1,4 @@
-// Secret Encryption Key for Bcine Proxy
+// Secret Encryption Key for Bcine / NetPlayer Proxy
 const STREAM_SECRET = '1embed_secret_2026';
 
 // In-Memory Short Key Store with LRU Cache
@@ -67,20 +67,25 @@ function saveToShortStore(payload) {
   return key;
 }
 
-// Check kung lehitimong gikan sa main.bcine.ru o bcine.ru
+// Check kung lehitimong gikan sa bcine o authorized player origin
 function isAuthorizedOrigin(request) {
   const reqOrigin = (request.headers.get("Origin") || "").toLowerCase();
   const reqReferer = (request.headers.get("Referer") || "").toLowerCase();
+
+  // If request has no Origin/Referer (direct media tag or proxy request from browser), allow
+  if (!reqOrigin && !reqReferer) return true;
 
   const isBcine =
     reqOrigin.includes("main.bcine.ru") ||
     reqReferer.includes("main.bcine.ru") ||
     reqOrigin.includes("bcine.ru") ||
-    reqReferer.includes("bcine.ru");
+    reqReferer.includes("bcine.ru") ||
+    reqOrigin.includes("localhost") ||
+    reqReferer.includes("localhost") ||
+    reqOrigin.includes("run.app") ||
+    reqReferer.includes("run.app");
 
-  // Kung naay gawas nga domain (external scraper / unlisted site)
-  if (reqOrigin && !isBcine) return false;
-  if (reqReferer && !isBcine) return false;
+  if (!isBcine && (reqOrigin || reqReferer)) return false;
 
   return true;
 }
@@ -112,13 +117,13 @@ export default {
     const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
     const reqOrigin = request.headers.get("Origin") || "";
 
-    // 1. Strict CORS Headers para sa main.bcine.ru
-    const allowedOrigin = reqOrigin.includes("bcine.ru") ? reqOrigin : "https://main.bcine.ru";
+    // 1. Dynamic CORS Headers
+    const allowedOrigin = reqOrigin || "*";
 
     const corsHeaders = {
       "Access-Control-Allow-Origin": allowedOrigin,
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Range, DNT, User-Agent, X-Requested-With, If-Modified-Since, Cache-Control, Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Range, DNT, User-Agent, X-Requested-With, If-Modified-Since, Cache-Control, Content-Type, Authorization, Accept",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition",
       "Access-Control-Allow-Credentials": "true",
       "Vary": "Origin, Access-Control-Request-Headers",
@@ -186,7 +191,7 @@ export default {
     // 4. Subtitle Endpoint with 24-Hour Edge Caching
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
-        return new Response("Visit bcine.ru to watch.", { status: 400, headers: corsHeaders });
+        return new Response("Invalid subtitle request", { status: 400, headers: corsHeaders });
       }
 
       try {
@@ -220,7 +225,7 @@ export default {
           },
         });
       } catch (err) {
-        return new Response("Visit bcine.ru to watch.", { status: 500, headers: corsHeaders });
+        return new Response("Failed to fetch subtitle", { status: 500, headers: corsHeaders });
       }
     }
 
@@ -239,14 +244,25 @@ export default {
       const targetUrlStr = payload.u;
       const initialTarget = new URL(targetUrlStr);
 
-      const referer = payload.r || initialTarget.origin + "/";
-      const origin = payload.o || initialTarget.origin;
+      // Automatic Referer & Origin para sa Yoru (films365 / xdownloaderx / xstreamx) ug uban pang sources
+      let referer = payload.r || "";
+      let origin = payload.o || "";
+
+      const lowerTarget = targetUrlStr.toLowerCase();
+      if (lowerTarget.includes("films365") || lowerTarget.includes("xdownloaderx") || lowerTarget.includes("xstreamx")) {
+        referer = referer || "https://www.films365.org/";
+        origin = origin || "https://www.films365.org";
+      } else {
+        referer = referer || initialTarget.origin + "/";
+        origin = origin || initialTarget.origin;
+      }
+
       const parsedHeaders = payload.h || {};
 
       const reqHeaders = new Headers();
       reqHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/127.0.0.0 Safari/537.36");
       reqHeaders.set("Accept", "*/*");
-      reqHeaders.set("Referer", referer);
+      if (referer) reqHeaders.set("Referer", referer);
       if (origin) reqHeaders.set("Origin", origin);
 
       for (const [key, value] of Object.entries(parsedHeaders)) {
@@ -255,19 +271,22 @@ export default {
         }
       }
 
+      // RANGE HEADER HANDLING: I-pass ang Range header para sa fast seeking ug 206 Partial Content
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
       }
 
-      const isExplicitSegment = url.pathname.endsWith(".ts") || url.pathname.endsWith(".mp4");
+      const isExplicitSegment = url.pathname.endsWith(".ts");
       const isExplicitM3U8 = url.pathname.endsWith(".m3u8");
 
-      // TURBO FETCH: I-cache ang video chunks sa Cloudflare Edge CDN aron makatipid og bandwidth ug paspas ang load
+      // Ayaw i-cache ang Range requests o MP4 files aron dili ma-block ang 206 status ug seeking
+      const shouldEdgeCache = isExplicitSegment && !rangeHeader;
+
       const proxyRes = await fetch(targetUrlStr, {
         method: request.method,
         headers: reqHeaders,
-        cf: isExplicitSegment ? { cacheEverything: true, cacheTtl: 86400 * 7 } : { cacheEverything: false },
+        cf: shouldEdgeCache ? { cacheEverything: true, cacheTtl: 86400 * 7 } : { cacheEverything: false },
         redirect: "follow",
       });
 
@@ -301,10 +320,10 @@ export default {
       if (isM3U8) {
         resHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
       } else {
-        // High-Speed Edge & Browser Caching para sa video segments
-        resHeaders.set("Cache-Control", "public, max-age=604800, s-maxage=604800, immutable");
+        resHeaders.set("Cache-Control", "public, max-age=604800, s-maxage=604800");
       }
 
+      // Siguruha nga naka-set ang Accept-Ranges para sa browser video player
       if (!resHeaders.get("Accept-Ranges")) {
         resHeaders.set("Accept-Ranges", "bytes");
       }
@@ -380,7 +399,7 @@ export default {
         });
       }
 
-      // 7. Video Chunk Stream Delivery
+      // 7. Video Chunk / 206 Partial Content Stream Delivery
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
