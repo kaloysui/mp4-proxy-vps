@@ -1,18 +1,5 @@
-// Secret Encryption Key for 1Embed Proxy
+// Secret Key para sa Token Encryption
 const STREAM_SECRET = '1embed_secret_2026';
-
-// In-Memory Short Key Store (8-character random tokens)
-const tokenStore = new Map();
-const MAX_CACHE_SIZE = 15000;
-
-// Rate Limiter Store for Non-Allowed requests (IP -> { count, startTime })
-const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW_MS = 60000; // 1 Minute window
-const MAX_EXTERNAL_REQUESTS = 2;    // Max 2 requests for non-whitelisted origins
-
-function generateShortKey() {
-  return Math.random().toString(36).substring(2, 10);
-}
 
 function packSync(obj) {
   try {
@@ -51,69 +38,19 @@ function unpackSync(token) {
       decrypted[i] = bytes[i] ^ secretBytes[i % secretBytes.length];
     }
     const decoder = new TextDecoder();
-    const json = decoder.decode(decrypted);
-    return JSON.parse(json);
+    return JSON.parse(decoder.decode(decrypted));
   } catch (e) {
     return null;
   }
 }
 
-function saveToShortStore(payload) {
-  if (tokenStore.size >= MAX_CACHE_SIZE) {
-    const oldestKey = tokenStore.keys().next().value;
-    if (oldestKey) tokenStore.delete(oldestKey);
-  }
-  const key = generateShortKey();
-  tokenStore.set(key, payload);
-  return key;
-}
-
-// STRICT Domain Check: ONLY 1embed.cc and main.bcine.ru are allowed
-function checkIsAllowedOrigin(request) {
-  const reqOrigin = request.headers.get("Origin") || "";
-  const reqReferer = request.headers.get("Referer") || "";
-
-  const is1Embed = reqOrigin.includes("1embed.cc") || reqReferer.includes("1embed.cc");
-  const isBcine = reqOrigin.includes("main.bcine.ru") || reqReferer.includes("main.bcine.ru");
-  const isAllowed = is1Embed || isBcine;
-
-  let fallbackOrigin = "https://1embed.cc";
-  if (isBcine) {
-    fallbackOrigin = "https://main.bcine.ru";
-  }
-
-  return {
-    isAllowed,
-    allowedOrigin: isAllowed ? (reqOrigin || fallbackOrigin) : "https://1embed.cc"
-  };
-}
-
-// Rate Limiter (Applies strictly to external domains, limit = 2 per min)
-function checkRateLimit(clientIp) {
-  const now = Date.now();
-  const record = rateLimitMap.get(clientIp);
-
-  if (!record || now - record.startTime > RATE_LIMIT_WINDOW_MS) {
-    rateLimitMap.set(clientIp, { count: 1, startTime: now });
-    return true; // Allowed
-  }
-
-  if (record.count >= MAX_EXTERNAL_REQUESTS) {
-    return false; // Rate limit exceeded (Max 2)
-  }
-
-  record.count += 1;
-  return true; // Allowed
-}
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown-ip";
-    const { isAllowed, allowedOrigin } = checkIsAllowedOrigin(request);
 
+    // Bukas sa lahat ng domains (Wildcard CORS)
     const corsHeaders = {
-      "Access-Control-Allow-Origin": allowedOrigin,
+      "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
       "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition",
@@ -130,41 +67,23 @@ export default {
       });
     }
 
-    // 2. Strict Rate Limit for non-whitelisted callers (Limit = 2)
-    if (!isAllowed) {
-      const allowed = checkRateLimit(clientIp);
-      if (!allowed) {
-        return new Response("Too Many Requests. Rate limit of 2 per minute reached for unauthorized callers.", {
-          status: 429,
-          headers: corsHeaders,
-        });
-      }
-    }
-
-    // Extract path key (e.g. "/a8x9z2k1.ts" -> "a8x9z2k1", "/token.m3u8" -> "token")
+    // 2. I-extract ang payload mula sa URL Path o Query
     const pathname = url.pathname.substring(1);
-    const pathKey = pathname.replace(/\.(m3u8|ts|mp4|vtt)$/i, '');
+    const tokenFromPath = pathname.replace(/\.(m3u8|ts|mp4|vtt|key)$/i, '');
 
     let payload = null;
 
-    // A. Check in-memory short key cache
-    if (pathKey && tokenStore.has(pathKey)) {
-      payload = tokenStore.get(pathKey);
-    } 
-    // B. Check if path is encrypted token
-    else if (pathKey) {
-      payload = unpackSync(pathKey);
+    // A. Subukang i-decode mula sa encrypted path token
+    if (tokenFromPath) {
+      payload = unpackSync(tokenFromPath);
     }
 
-    // C. Fallbacks for query params (?v=, ?d=, ?url=)
+    // B. Subukang i-decode mula sa query params (?d= o ?url=)
     if (!payload) {
-      const qv = url.searchParams.get("v");
       const qd = url.searchParams.get("d");
       const qurl = url.searchParams.get("url");
 
-      if (qv && tokenStore.has(qv)) {
-        payload = tokenStore.get(qv);
-      } else if (qd) {
+      if (qd) {
         payload = unpackSync(qd);
       } else if (qurl) {
         payload = {
@@ -175,13 +94,10 @@ export default {
       }
     }
 
-    // 3. Subtitle Conversion Endpoint (/vtt or /*.vtt)
+    // 3. Subtitle / WebVTT Conversion Endpoint
     if (url.pathname.includes("vtt")) {
       if (!payload || !payload.u) {
-        return new Response("Missing target subtitle parameter", {
-          status: 400,
-          headers: corsHeaders,
-        });
+        return new Response("Missing subtitle payload", { status: 400, headers: corsHeaders });
       }
 
       try {
@@ -215,13 +131,13 @@ export default {
           },
         });
       } catch (err) {
-        return new Response("Error converting subtitle: " + err.message, { status: 500, headers: corsHeaders });
+        return new Response("Subtitle Error: " + err.message, { status: 500, headers: corsHeaders });
       }
     }
 
-    // 4. Media Streaming Proxy
+    // 4. Default greeting kung walang payload
     if (!payload || !payload.u) {
-      return new Response("1Embed Stream Proxy Active", {
+      return new Response("Stream Proxy Active (Open Access)", {
         status: 200,
         headers: {
           ...corsHeaders,
@@ -230,6 +146,7 @@ export default {
       });
     }
 
+    // 5. Media Proxy Handler
     try {
       const targetUrlStr = payload.u;
       const initialTarget = new URL(targetUrlStr);
@@ -245,12 +162,14 @@ export default {
       reqHeaders.set("Referer", referer);
       if (origin) reqHeaders.set("Origin", origin);
 
+      // Custom headers
       for (const [key, value] of Object.entries(parsedHeaders)) {
         if (!["referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
           reqHeaders.set(key, String(value));
         }
       }
 
+      // Range header para sa video seeking
       const rangeHeader = request.headers.get("Range");
       if (rangeHeader) {
         reqHeaders.set("Range", rangeHeader);
@@ -298,12 +217,13 @@ export default {
         resHeaders.set("Accept-Ranges", "bytes");
       }
 
-      // 5. M3U8 Playlist Parser & Rewriter using Direct Path Clean URLs (e.g. /{shortKey}.ts)
+      // 6. M3U8 Playlist Parsing at Pag-rewrite gamit ang Stateless Encrypted URLs
       if (isM3U8 && proxyRes.ok) {
-        const playlistText = await proxyRes.text();
+        const rawPlaylist = await proxyRes.text();
         const proxyOrigin = url.origin;
 
-        const lines = playlistText.split("\n");
+        // Linisin ang CRLF (\r\n) line breaks
+        const lines = rawPlaylist.replace(/\r/g, "").split("\n");
         let isNextStreamInf = false;
         let isNextExtInf = false;
 
@@ -320,24 +240,29 @@ export default {
               isNextStreamInf = false;
             }
 
+            // I-rewrite ang URI attributes (hal. #EXT-X-MEDIA, #EXT-X-KEY)
             return line.replace(/URI=(["'])(.*?)\1|URI=([^\s,]+)/gi, (match, quote, p1, p2) => {
               const rawUri = p1 || p2;
               if (!rawUri) return match;
               try {
                 const absUri = new URL(rawUri, finalResolvedUrl).href;
                 const isMedia = trimmed.startsWith("#EXT-X-MEDIA");
-                const ext = isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8")) ? "m3u8" : "ts";
+                const isKey = trimmed.startsWith("#EXT-X-KEY");
+
+                let ext = "ts";
+                if (isKey) ext = "key";
+                else if (isMedia && (absUri.includes(".m3u8") || absUri.includes("cdn-m3u8"))) ext = "m3u8";
+
                 const q = quote || '"';
-                
-                const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-                return `URI=${q}${proxyOrigin}/${key}.${ext}${q}`;
+                const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+                return `URI=${q}${proxyOrigin}/${token}.${ext}${q}`;
               } catch (e) {
                 return match;
               }
             });
           }
 
-          // Content Line
+          // Content Stream / TS Segment Line
           try {
             const absUri = new URL(trimmed, finalResolvedUrl).href;
             let ext = "ts";
@@ -349,9 +274,9 @@ export default {
 
             isNextStreamInf = false;
             isNextExtInf = false;
-            
-            const key = saveToShortStore({ u: absUri, r: referer, o: origin, h: parsedHeaders });
-            return `${proxyOrigin}/${key}.${ext}`;
+
+            const token = packSync({ u: absUri, r: referer, o: origin, h: parsedHeaders });
+            return `${proxyOrigin}/${token}.${ext}`;
           } catch (e) {
             isNextStreamInf = false;
             isNextExtInf = false;
@@ -369,12 +294,13 @@ export default {
         });
       }
 
-      // 6. Binary Streaming
+      // 7. Binary Stream Passthrough
       return new Response(proxyRes.body, {
         status: proxyRes.status,
         statusText: proxyRes.statusText,
         headers: resHeaders,
       });
+
     } catch (err) {
       return new Response("Stream Proxy Error: " + err.message, {
         status: 502,
